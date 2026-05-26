@@ -1,0 +1,6 @@
+[package]
+name = "slipstream-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
