@@ -4,3 +4,42 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# Internal Logic
+slipstream-common = { workspace = true }
+
+# Solana Ecosystem
+# We need 'sdk' for types (Pubkey, Keypair) and 'client' for RPC calls.
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-rpc-client-api = { workspace = true }
+
+# Core Async Runtime
+tokio = { workspace = true }
+
+# Networking (The Engine)
+quinn = { workspace = true }
+rustls = { workspace = true }
+
+# Error Handling & Logging
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+# Concurrency
+dashmap = "5.5"
+
+# HTTP Client (for blocklist fetching) - using 0.11 for Solana 1.18 compatibility
+reqwest = { version = "0.11", default-features = false, features = [
+    "rustls-tls",
+] }
+
+# Geyser Integration
+yellowstone-grpc-proto = { workspace = true }
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+
+[dev-dependencies]
+# Required for the "Mock Server" in our integration tests.
+rcgen = { workspace = true }

@@ -9,3 +9,47 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+[workspace.dependencies]
+# --- Core Async ---
+tokio = { version = "1.35", features = ["full"] }
+
+# --- Solana Ecosystem ---
+solana-sdk = "2.1"
+solana-client = "2.1"
+solana-rpc-client-api = "2.1"
+
+# --- Networking (Engine) ---
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+] }
+rcgen = "0.13" # For Certificate Generation
+
+# --- Utils ---
+anyhow = "1.0"
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.10"
+clap = { version = "4.4", features = ["derive"] }
+dirs = "5.0"
+bincode = "1.3"
+
+# --- Geyser Integration ---
+yellowstone-grpc-proto = "10.1"
+tonic = { version = "0.14", features = [
+    "tls-ring",
+    "tls-native-roots",
+    "channel",
+    "transport",
+] }
+tokio-stream = "0.1"
+futures = "0.3"
+http = "1.0"
+
+dotenv = "0.15"
+
+# --- Internal Paths ---
+slipstream-common = { path = "crates/slipstream-common" }
+slipstream-net = { path = "crates/slipstream-net" }
