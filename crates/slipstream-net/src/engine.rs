@@ -40,6 +40,13 @@ impl QuicEngine {
         Ok(())
     }
 
+    pub async fn get_connection_handle(
+        &self,
+        target: SocketAddr,
+    ) -> Result<Connection, SlipstreamError> {
+        self.get_connection(target).await
+    }
+
     async fn get_connection(&self, addr: SocketAddr) -> Result<Connection, SlipstreamError> {
         if let Some(conn) = self.connection_cache.get(&addr) {
             if conn.close_reason().is_none() {

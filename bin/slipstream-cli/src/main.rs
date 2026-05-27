@@ -90,14 +90,9 @@ async fn main() -> anyhow::Result<()> {
             recipient,
             priority_fee,
         } => {
-            println!("[spam] not implemented yet");
-            println!("rpc: {}", cfg.rpc_url);
-            println!("count: {count}");
-            println!("recipient: {}", recipient.as_deref().unwrap_or("<self>"));
-            println!(
-                "priority_fee: {}",
-                priority_fee.unwrap_or(cfg.default_priority_fee)
-            );
+            let to = parse_recipient(recipient, &identity)?;
+            let fee = priority_fee.unwrap_or(cfg.default_priority_fee);
+            spam_transactions(&cfg, &identity, to, count, fee).await?;
         }
     }
 
@@ -195,6 +190,80 @@ async fn fire_transaction(
         .first()
         .ok_or_else(|| anyhow::anyhow!("transaction has no signatures"))?;
     println!("sent tx to {target} | signature: {sig}");
+    Ok(())
+}
+
+async fn spam_transactions(
+    cfg: &Config,
+    identity: &Keypair,
+    recipient: Pubkey,
+    count: u64,
+    priority_fee: u64,
+) -> anyhow::Result<()> {
+    let cartographer = Arc::new(Cartographer::new(cfg.rpc_url.clone()));
+    cartographer
+        .refresh_topology()
+        .await
+        .context("failed to refresh topology")?;
+    cartographer
+        .update_schedule()
+        .await
+        .context("failed to load leader schedule")?;
+
+    let slot = cartographer.get_known_slot();
+    let target = cartographer
+        .get_target(slot)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no leader found for slot {}", slot))?;
+
+    let rpc = solana_client::nonblocking::rpc_client::RpcClient::new(cfg.rpc_url.clone());
+    let latest_blockhash = rpc.get_latest_blockhash().await?;
+
+    let instructions = vec![
+        ComputeBudgetInstruction::set_compute_unit_limit(cfg.default_compute_unit_limit),
+        ComputeBudgetInstruction::set_compute_unit_price(priority_fee),
+        system_instruction::transfer(&identity.pubkey(), &recipient, 1),
+    ];
+
+    let tx = Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&identity.pubkey()),
+        &[identity],
+        latest_blockhash,
+    );
+    let tx_bytes = bincode::serialize(&tx)?;
+
+    let engine = QuicEngine::new(identity)?;
+    let connection = engine.get_connection_handle(target).await?;
+
+    let mut sent = 0_u64;
+    let mut failed = 0_u64;
+
+    for i in 0..count {
+        match connection.open_uni().await {
+            Ok(mut stream) => {
+                if let Err(e) = stream.write_all(&tx_bytes).await {
+                    eprintln!("stream write failed (tx {}): {}", i, e);
+                    failed += 1;
+                    continue;
+                }
+                if let Err(e) = stream.finish() {
+                    eprintln!("stream finish failed (tx {}): {}", i, e);
+                    failed += 1;
+                    continue;
+                }
+                sent += 1;
+            }
+            Err(e) => {
+                eprintln!("open stream failed (tx {}): {}", i, e);
+                failed += 1;
+            }
+        }
+    }
+
+    println!(
+        "spam complete | target: {target} | requested: {count} | sent: {sent} | failed: {failed}"
+    );
     Ok(())
 }
 
