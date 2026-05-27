@@ -14,6 +14,15 @@ pub enum SlipstreamError {
     #[error("certificate error: {0}")]
     Certificate(String),
 
+    #[error("invalid uri: {0}")]
+    InvalidUri(String),
+
+    #[error("geyser error: {0}")]
+    Geyser(String),
+
+    #[error("channel error: {0}")]
+    Channel(String),
+
     #[error("transport error: {0}")]
     Transport(#[from] quinn::ConnectionError),
 

@@ -1,5 +1,6 @@
 use crate::error::SlipstreamError;
 use std::env;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -9,6 +10,8 @@ pub struct Config {
     pub scout_interval_ms: u64,
     pub scout_lookahead_slots: u64,
     pub monitor_interval_ms: u64,
+    pub geyser_reconnect_delay_ms: u64,
+    pub geyser_max_reconnect_delay_ms: u64,
     pub default_compute_unit_limit: u32,
     pub default_priority_fee: u64,
 }
@@ -23,6 +26,8 @@ impl Config {
             scout_interval_ms: parse_env("SCOUT_INTERVAL_MS", 1000),
             scout_lookahead_slots: parse_env("SCOUT_LOOKAHEAD_SLOTS", 10),
             monitor_interval_ms: parse_env("MONITOR_INTERVAL_MS", 400),
+            geyser_reconnect_delay_ms: parse_env("GEYSER_RECONNECT_DELAY_MS", 1000),
+            geyser_max_reconnect_delay_ms: parse_env("GEYSER_MAX_RECONNECT_DELAY_MS", 10_000),
             default_compute_unit_limit: parse_env("DEFAULT_COMPUTE_UNIT_LIMIT", 200_000),
             default_priority_fee: parse_env("DEFAULT_PRIORITY_FEE", 100_000),
         };
@@ -58,7 +63,33 @@ impl Config {
             ));
         }
 
+        if self.geyser_max_reconnect_delay_ms < self.geyser_reconnect_delay_ms {
+            return Err(SlipstreamError::ConfigValidation(
+                "GEYSER_MAX_RECONNECT_DELAY_MS must be >= GEYSER_RECONNECT_DELAY_MS".to_string(),
+            ));
+        }
+
         Ok(())
+    }
+
+    pub fn rpc_poll_interval(&self) -> Duration {
+        Duration::from_millis(self.rpc_poll_interval_ms)
+    }
+
+    pub fn monitor_interval(&self) -> Duration {
+        Duration::from_millis(self.monitor_interval_ms)
+    }
+
+    pub fn scout_interval(&self) -> Duration {
+        Duration::from_millis(self.scout_interval_ms)
+    }
+
+    pub fn geyser_reconnect_delay(&self) -> Duration {
+        Duration::from_millis(self.geyser_reconnect_delay_ms)
+    }
+
+    pub fn geyser_max_reconnect_delay(&self) -> Duration {
+        Duration::from_millis(self.geyser_max_reconnect_delay_ms)
     }
 }
 

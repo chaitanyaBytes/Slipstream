@@ -2,7 +2,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
 use slipstream_common::Config;
-use slipstream_net::{Cartographer, QuicEngine};
+use slipstream_net::{spawn_geyser_monitor, Cartographer, QuicEngine};
 #[allow(deprecated)]
 use solana_sdk::{
     compute_budget::ComputeBudgetInstruction,
@@ -126,20 +126,36 @@ async fn monitor_loop(
         .await
         .context("failed to load leader schedule")?;
 
-    let poll = Duration::from_millis(cfg.rpc_poll_interval_ms);
-    let print_interval = Duration::from_millis(cfg.monitor_interval_ms);
-    let scout_interval = Duration::from_millis(cfg.scout_interval_ms);
-    let scout_lookahead_slots = cfg.scout_lookahead_slots;
+    if let Some(url) = cfg.geyser_url.clone() {
+        let startup_rx = spawn_geyser_monitor(
+            url,
+            Arc::clone(&cartographer),
+            cfg.geyser_reconnect_delay(),
+            cfg.geyser_max_reconnect_delay(),
+        );
 
-    {
-        let c = Arc::clone(&cartographer);
-        tokio::spawn(async move {
-            loop {
-                let _ = c.fetch_rpc_slot().await;
-                tokio::time::sleep(poll).await;
+        match tokio::time::timeout(Duration::from_secs(10), startup_rx).await {
+            Ok(Ok(Ok(()))) => println!("mode: hybrid (rpc map + geyser clock)"),
+            Ok(Ok(Err(e))) => {
+                println!("geyser startup failed: {}. using rpc polling fallback", e);
+                spawn_rpc_slot_poller(Arc::clone(&cartographer), cfg.rpc_poll_interval());
             }
-        });
+            Ok(Err(_)) => {
+                println!("geyser startup signal lost. using rpc polling fallback");
+                spawn_rpc_slot_poller(Arc::clone(&cartographer), cfg.rpc_poll_interval());
+            }
+            Err(_) => {
+                println!("geyser startup timed out. using rpc polling fallback");
+                spawn_rpc_slot_poller(Arc::clone(&cartographer), cfg.rpc_poll_interval());
+            }
+        }
+    } else {
+        println!("mode: legacy (rpc polling)");
+        spawn_rpc_slot_poller(Arc::clone(&cartographer), cfg.rpc_poll_interval());
     }
+
+    let scout_interval = cfg.scout_interval();
+    let scout_lookahead_slots = cfg.scout_lookahead_slots;
 
     {
         let c = Arc::clone(&cartographer);
@@ -168,8 +184,17 @@ async fn monitor_loop(
             println!("slot: {slot} | leader: <unknown>");
         }
 
-        tokio::time::sleep(print_interval).await;
+        tokio::time::sleep(cfg.monitor_interval()).await;
     }
+}
+
+fn spawn_rpc_slot_poller(cartographer: Arc<Cartographer>, poll_interval: Duration) {
+    tokio::spawn(async move {
+        loop {
+            let _ = cartographer.fetch_rpc_slot().await;
+            tokio::time::sleep(poll_interval).await;
+        }
+    });
 }
 
 async fn fire_transaction(
