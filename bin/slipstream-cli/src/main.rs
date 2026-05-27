@@ -2,7 +2,15 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
 use slipstream_common::Config;
-use slipstream_net::Cartographer;
+use slipstream_net::{Cartographer, QuicEngine};
+#[allow(deprecated)]
+use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction,
+    pubkey::Pubkey,
+    signature::{read_keypair_file, Keypair, Signer},
+    system_instruction,
+    transaction::Transaction,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,32 +66,31 @@ async fn main() -> anyhow::Result<()> {
         cfg.geyser_url = Some(geyser);
     }
 
-    let keypair_path = cli
-        .keypair
-        .unwrap_or_else(default_keypair_path)
-        .display()
-        .to_string();
+    let keypair_path = cli.keypair.unwrap_or_else(default_keypair_path);
+    let identity = read_keypair_file(&keypair_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to load keypair from {:?}: {}. use --keypair to specify path",
+            keypair_path,
+            e
+        )
+    })?;
 
     match cli.command {
-        Commands::Monitor => monitor_loop(&cfg, &keypair_path).await?,
+        Commands::Monitor => monitor_loop(&cfg, &keypair_path.display().to_string()).await?,
         Commands::Fire {
             recipient,
             priority_fee,
         } => {
-            println!("[fire] dry-run");
-            println!("rpc: {}", cfg.rpc_url);
-            println!("recipient: {}", recipient.as_deref().unwrap_or("<self>"));
-            println!(
-                "priority_fee: {}",
-                priority_fee.unwrap_or(cfg.default_priority_fee)
-            );
+            let to = parse_recipient(recipient, &identity)?;
+            let fee = priority_fee.unwrap_or(cfg.default_priority_fee);
+            fire_transaction(&cfg, &identity, to, fee).await?;
         }
         Commands::Spam {
             count,
             recipient,
             priority_fee,
         } => {
-            println!("[spam] dry-run");
+            println!("[spam] not implemented yet");
             println!("rpc: {}", cfg.rpc_url);
             println!("count: {count}");
             println!("recipient: {}", recipient.as_deref().unwrap_or("<self>"));
@@ -137,6 +144,66 @@ async fn monitor_loop(cfg: &Config, keypair_path: &str) -> anyhow::Result<()> {
         }
 
         tokio::time::sleep(print_interval).await;
+    }
+}
+
+async fn fire_transaction(
+    cfg: &Config,
+    identity: &Keypair,
+    recipient: Pubkey,
+    priority_fee: u64,
+) -> anyhow::Result<()> {
+    let cartographer = Arc::new(Cartographer::new(cfg.rpc_url.clone()));
+    cartographer
+        .refresh_topology()
+        .await
+        .context("failed to refresh topology")?;
+    cartographer
+        .update_schedule()
+        .await
+        .context("failed to load leader schedule")?;
+
+    let slot = cartographer.get_known_slot();
+    let target = cartographer
+        .get_target(slot)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no leader found for slot {}", slot))?;
+
+    let rpc = solana_client::nonblocking::rpc_client::RpcClient::new(cfg.rpc_url.clone());
+    let latest_blockhash = rpc.get_latest_blockhash().await?;
+
+    let instructions = vec![
+        ComputeBudgetInstruction::set_compute_unit_limit(cfg.default_compute_unit_limit),
+        ComputeBudgetInstruction::set_compute_unit_price(priority_fee),
+        system_instruction::transfer(&identity.pubkey(), &recipient, 1),
+    ];
+
+    let tx = Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&identity.pubkey()),
+        &[identity],
+        latest_blockhash,
+    );
+
+    let tx_bytes = bincode::serialize(&tx)?;
+
+    let engine = QuicEngine::new(identity)?;
+    engine.send_transaction(target, tx_bytes).await?;
+
+    let sig = tx
+        .signatures
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("transaction has no signatures"))?;
+    println!("sent tx to {target} | signature: {sig}");
+    Ok(())
+}
+
+fn parse_recipient(recipient: Option<String>, identity: &Keypair) -> anyhow::Result<Pubkey> {
+    match recipient {
+        Some(s) => s
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid recipient pubkey: {}", s)),
+        None => Ok(identity.pubkey()),
     }
 }
 
