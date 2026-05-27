@@ -2,7 +2,10 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
 use slipstream_common::Config;
+use slipstream_net::Cartographer;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Parser)]
 #[command(name = "slipstream")]
@@ -62,12 +65,7 @@ async fn main() -> anyhow::Result<()> {
         .to_string();
 
     match cli.command {
-        Commands::Monitor => {
-            println!("[monitor] config loaded");
-            println!("rpc: {}", cfg.rpc_url);
-            println!("geyser: {}", cfg.geyser_url.as_deref().unwrap_or("<none>"));
-            println!("keypair: {keypair_path}");
-        }
+        Commands::Monitor => monitor_loop(&cfg, &keypair_path).await?,
         Commands::Fire {
             recipient,
             priority_fee,
@@ -97,6 +95,49 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn monitor_loop(cfg: &Config, keypair_path: &str) -> anyhow::Result<()> {
+    println!("[monitor] starting");
+    println!("rpc: {}", cfg.rpc_url);
+    println!("geyser: {}", cfg.geyser_url.as_deref().unwrap_or("<none>"));
+    println!("keypair: {keypair_path}");
+
+    let cartographer = Arc::new(Cartographer::new(cfg.rpc_url.clone()));
+    cartographer
+        .refresh_topology()
+        .await
+        .context("failed to refresh topology")?;
+    cartographer
+        .update_schedule()
+        .await
+        .context("failed to load leader schedule")?;
+
+    let poll = Duration::from_millis(cfg.rpc_poll_interval_ms);
+    let print_interval = Duration::from_millis(cfg.monitor_interval_ms);
+
+    {
+        let c = Arc::clone(&cartographer);
+        tokio::spawn(async move {
+            loop {
+                let _ = c.fetch_rpc_slot().await;
+                tokio::time::sleep(poll).await;
+            }
+        });
+    }
+
+    loop {
+        let slot = cartographer.get_known_slot();
+        if slot == 0 {
+            println!("slot: loading...");
+        } else if let Some(target) = cartographer.get_target(slot).await {
+            println!("slot: {slot} | leader: {target}");
+        } else {
+            println!("slot: {slot} | leader: <unknown>");
+        }
+
+        tokio::time::sleep(print_interval).await;
+    }
 }
 
 fn default_keypair_path() -> PathBuf {
