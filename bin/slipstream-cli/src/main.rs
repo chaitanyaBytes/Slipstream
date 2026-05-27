@@ -67,16 +67,23 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let keypair_path = cli.keypair.unwrap_or_else(default_keypair_path);
-    let identity = read_keypair_file(&keypair_path).map_err(|e| {
+    let identity = Arc::new(read_keypair_file(&keypair_path).map_err(|e| {
         anyhow::anyhow!(
             "failed to load keypair from {:?}: {}. use --keypair to specify path",
             keypair_path,
             e
         )
-    })?;
+    })?);
 
     match cli.command {
-        Commands::Monitor => monitor_loop(&cfg, &keypair_path.display().to_string()).await?,
+        Commands::Monitor => {
+            monitor_loop(
+                &cfg,
+                &keypair_path.display().to_string(),
+                Arc::clone(&identity),
+            )
+            .await?
+        }
         Commands::Fire {
             recipient,
             priority_fee,
@@ -99,7 +106,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn monitor_loop(cfg: &Config, keypair_path: &str) -> anyhow::Result<()> {
+async fn monitor_loop(
+    cfg: &Config,
+    keypair_path: &str,
+    identity: Arc<Keypair>,
+) -> anyhow::Result<()> {
     println!("[monitor] starting");
     println!("rpc: {}", cfg.rpc_url);
     println!("geyser: {}", cfg.geyser_url.as_deref().unwrap_or("<none>"));
@@ -117,6 +128,8 @@ async fn monitor_loop(cfg: &Config, keypair_path: &str) -> anyhow::Result<()> {
 
     let poll = Duration::from_millis(cfg.rpc_poll_interval_ms);
     let print_interval = Duration::from_millis(cfg.monitor_interval_ms);
+    let scout_interval = Duration::from_millis(cfg.scout_interval_ms);
+    let scout_lookahead_slots = cfg.scout_lookahead_slots;
 
     {
         let c = Arc::clone(&cartographer);
@@ -124,6 +137,23 @@ async fn monitor_loop(cfg: &Config, keypair_path: &str) -> anyhow::Result<()> {
             loop {
                 let _ = c.fetch_rpc_slot().await;
                 tokio::time::sleep(poll).await;
+            }
+        });
+    }
+
+    {
+        let c = Arc::clone(&cartographer);
+        let engine = Arc::new(QuicEngine::new(&identity)?);
+        tokio::spawn(async move {
+            loop {
+                let slot = c.get_known_slot();
+                if slot > 0 {
+                    let upcoming = c.get_upcoming_leaders(slot, scout_lookahead_slots).await;
+                    for target in upcoming {
+                        let _ = engine.get_connection_handle(target).await;
+                    }
+                }
+                tokio::time::sleep(scout_interval).await;
             }
         });
     }
@@ -144,7 +174,7 @@ async fn monitor_loop(cfg: &Config, keypair_path: &str) -> anyhow::Result<()> {
 
 async fn fire_transaction(
     cfg: &Config,
-    identity: &Keypair,
+    identity: &Arc<Keypair>,
     recipient: Pubkey,
     priority_fee: u64,
 ) -> anyhow::Result<()> {
@@ -176,7 +206,7 @@ async fn fire_transaction(
     let tx = Transaction::new_signed_with_payer(
         &instructions,
         Some(&identity.pubkey()),
-        &[identity],
+        &[identity.as_ref()],
         latest_blockhash,
     );
 
@@ -195,7 +225,7 @@ async fn fire_transaction(
 
 async fn spam_transactions(
     cfg: &Config,
-    identity: &Keypair,
+    identity: &Arc<Keypair>,
     recipient: Pubkey,
     count: u64,
     priority_fee: u64,
@@ -228,7 +258,7 @@ async fn spam_transactions(
     let tx = Transaction::new_signed_with_payer(
         &instructions,
         Some(&identity.pubkey()),
-        &[identity],
+        &[identity.as_ref()],
         latest_blockhash,
     );
     let tx_bytes = bincode::serialize(&tx)?;
@@ -267,7 +297,7 @@ async fn spam_transactions(
     Ok(())
 }
 
-fn parse_recipient(recipient: Option<String>, identity: &Keypair) -> anyhow::Result<Pubkey> {
+fn parse_recipient(recipient: Option<String>, identity: &Arc<Keypair>) -> anyhow::Result<Pubkey> {
     match recipient {
         Some(s) => s
             .parse()

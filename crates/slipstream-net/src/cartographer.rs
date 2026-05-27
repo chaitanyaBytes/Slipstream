@@ -46,6 +46,25 @@ impl Cartographer {
         map.get(&leader).copied()
     }
 
+    pub async fn get_upcoming_leaders(&self, current_slot: u64, lookahead: u64) -> Vec<SocketAddr> {
+        let schedule = self.schedule.read().await;
+        let node_map = self.node_map.read().await;
+
+        let mut out = Vec::new();
+        for i in 1..=lookahead {
+            let slot = current_slot + i;
+            if let Some(pubkey) = schedule.get(&slot) {
+                if let Some(addr) = node_map.get(pubkey) {
+                    if !out.contains(addr) {
+                        out.push(*addr);
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
     pub async fn refresh_topology(&self) -> Result<(), SlipstreamError> {
         info!("refreshing cluster topology...");
         let nodes = self.rpc.get_cluster_nodes().await.map_err(|e| {
