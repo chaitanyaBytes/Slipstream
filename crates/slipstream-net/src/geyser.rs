@@ -14,6 +14,7 @@ use yellowstone_grpc_proto::geyser::{
     geyser_client::GeyserClient, subscribe_update::UpdateOneof, SubscribeRequestFilterSlots,
 };
 
+/// Geyser listener for real-time slot updates via Yellowstone gRPC
 pub struct GeyserListener {
     client: GeyserClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>,
     cartographer: Arc<Cartographer>,
@@ -28,7 +29,7 @@ impl Interceptor for AuthInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         if let Some(token) = &self.token {
             let val = tonic::metadata::MetadataValue::from_str(token)
-                .map_err(|_| Status::invalid_argument("invalid token format"))?;
+                .map_err(|_| Status::invalid_argument("Invalid token format"))?;
             req.metadata_mut().insert("x-token", val);
         }
         Ok(req)
@@ -37,47 +38,49 @@ impl Interceptor for AuthInterceptor {
 
 impl GeyserListener {
     pub async fn connect(
-        endpoint: String,
+        mut endpoint: String,
         cartographer: Arc<Cartographer>,
     ) -> Result<Self, SlipstreamError> {
-        info!("geyser: parsing endpoint...");
-        let mut clean_endpoint = endpoint;
-        let mut x_token = None;
+        info!("Geyser: Parsing endpoint...");
 
-        if let Ok(uri) = clean_endpoint.parse::<Uri>() {
+        // Extract auth token from URL path if present (e.g., https://host/token123)
+        let mut x_token = None;
+        if let Ok(uri) = endpoint.parse::<Uri>() {
             if let Some(path) = uri.path_and_query() {
                 let path_str = path.as_str();
-                if path_str.len() > 1 && path_str != "/" {
+                if path_str.len() > 10 {
+                    info!("Geyser: Extracting Auth Token from URL path.");
                     x_token = Some(path_str.trim_start_matches('/').to_string());
 
+                    // Reconstruct clean endpoint without path
                     let scheme = uri.scheme_str().unwrap_or("https");
                     let authority = uri
                         .authority()
                         .ok_or_else(|| {
                             SlipstreamError::InvalidUri(format!(
-                                "geyser url missing authority: {}",
-                                clean_endpoint
+                                "Geyser URL missing authority: {}",
+                                endpoint
                             ))
                         })?
                         .as_str();
-                    clean_endpoint = format!("{}://{}", scheme, authority);
+                    endpoint = format!("{}://{}", scheme, authority);
                 }
             }
         }
 
-        info!("geyser: connecting to {}", clean_endpoint);
-        let channel = Endpoint::from_shared(clean_endpoint.clone())
-            .map_err(|e| SlipstreamError::InvalidUri(format!("invalid endpoint: {}", e)))?
-            .tls_config(tonic::transport::ClientTlsConfig::new())
-            .map_err(|e| SlipstreamError::Geyser(format!("tls config failed: {}", e)))?
+        info!("Geyser: Connecting to {}", endpoint);
+
+        // Create gRPC channel with TLS
+        let channel = Endpoint::from_shared(endpoint.clone())
+            .map_err(|e| SlipstreamError::InvalidUri(format!("Invalid endpoint: {}", e)))?
+            .tls_config(tonic::transport::ClientTlsConfig::new())?
             .connect()
-            .await
-            .map_err(|e| SlipstreamError::Geyser(format!("connect failed: {}", e)))?;
+            .await?;
 
         let interceptor = AuthInterceptor { token: x_token };
         let client = GeyserClient::with_interceptor(channel, interceptor);
 
-        info!("geyser: connected");
+        info!("Geyser: Connected.");
         Ok(Self {
             client,
             cartographer,
@@ -85,8 +88,9 @@ impl GeyserListener {
     }
 
     pub async fn start_tracking(&mut self) -> Result<(), SlipstreamError> {
-        info!("geyser: subscribing to slot updates");
+        info!("Geyser: Subscribing to Slot Updates.");
 
+        // Subscribe to slot updates only (minimal data)
         let mut slots = std::collections::HashMap::new();
         slots.insert(
             "client".to_string(),
@@ -113,24 +117,21 @@ impl GeyserListener {
         let (tx, rx) = mpsc::channel(32);
         tx.send(request)
             .await
-            .map_err(|e| SlipstreamError::Channel(format!("failed to send request: {}", e)))?;
+            .map_err(|e| SlipstreamError::ChannelError(format!("Failed to send request: {}", e)))?;
+        let request_stream = ReceiverStream::new(rx);
 
-        let response = self
-            .client
-            .subscribe(ReceiverStream::new(rx))
-            .await
-            .map_err(|e| SlipstreamError::Geyser(format!("subscribe failed: {}", e)))?;
+        let response = self.client.subscribe(request_stream).await?;
         let mut stream = response.into_inner();
 
-        info!("geyser: stream active");
-        while let Some(message) = stream
-            .message()
-            .await
-            .map_err(|e| SlipstreamError::Geyser(format!("stream message failed: {}", e)))?
-        {
+        info!("Geyser: Stream Active.");
+
+        // Process slot updates as they arrive (real-time)
+        while let Some(message) = stream.message().await? {
             if let Some(UpdateOneof::Slot(slot_update)) = message.update_oneof {
                 if slot_update.status == 0 {
-                    self.cartographer.update_slot(slot_update.slot);
+                    // Processed slot
+                    let slot = slot_update.slot;
+                    self.cartographer.update_slot(slot);
                 }
             }
         }
@@ -139,6 +140,8 @@ impl GeyserListener {
     }
 }
 
+/// Spawn Geyser monitor with exponential backoff reconnection.
+/// Returns a oneshot receiver that signals when the first connection attempt completes.
 pub fn spawn_geyser_monitor(
     endpoint: String,
     cartographer: Arc<Cartographer>,
@@ -151,34 +154,40 @@ pub fn spawn_geyser_monitor(
         let mut retry_delay = initial_delay;
         let mut startup_tx = Some(startup_tx);
 
+        // Reconnect loop with exponential backoff
         loop {
             match GeyserListener::connect(endpoint.clone(), cartographer.clone()).await {
                 Ok(mut listener) => {
+                    // Reset backoff on successful connection
                     retry_delay = initial_delay;
 
+                    // Signal startup success (once)
                     if let Some(tx) = startup_tx.take() {
                         let _ = tx.send(Ok(()));
                     }
 
                     if let Err(e) = listener.start_tracking().await {
                         error!(
-                            "geyser stream error: {}. reconnecting in {:?}",
+                            "Geyser Stream Error: {}. Reconnecting in {:?}...",
                             e, retry_delay
                         );
                     }
                 }
                 Err(e) => {
+                    // Signal startup failure (once)
                     if let Some(tx) = startup_tx.take() {
-                        let _ = tx.send(Err(SlipstreamError::Geyser(e.to_string())));
+                        let _ = tx.send(Err(SlipstreamError::GeyserError(e.to_string())));
                     }
                     error!(
-                        "geyser connect failed: {}. retrying in {:?}",
+                        "Geyser Connection Failed: {}. Retrying in {:?}...",
                         e, retry_delay
                     );
                 }
             }
 
             tokio::time::sleep(retry_delay).await;
+
+            // Exponential backoff: double delay, capped at max
             retry_delay = std::cmp::min(retry_delay * 2, max_delay);
         }
     });

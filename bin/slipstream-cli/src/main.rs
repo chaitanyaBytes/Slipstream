@@ -1,8 +1,12 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
+use log::{debug, error, info, warn};
 use slipstream_common::Config;
-use slipstream_net::{spawn_geyser_monitor, BlocklistManager, Cartographer, QuicEngine};
+use slipstream_net::{
+    blocklist::BlocklistManager, cartographer::Cartographer, engine::QuicEngine,
+    geyser::spawn_geyser_monitor,
+};
 #[allow(deprecated)]
 use solana_sdk::{
     compute_budget::ComputeBudgetInstruction,
@@ -15,10 +19,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(name = "slipstream")]
-#[command(about = "Low-latency Solana transaction sender")]
 struct Cli {
+    // Optional Override via Command Line
     #[arg(short, long)]
     rpc: Option<String>,
 
@@ -32,7 +36,7 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum Commands {
     Monitor,
     Fire {
@@ -53,54 +57,151 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // STEP 1: Load environment variables and initialize logging
     dotenv().ok();
     env_logger::init();
 
     let cli = Cli::parse();
-    let mut cfg = Config::from_env().context("failed to load config")?;
 
+    // STEP 2: Load and validate config (fail-fast on invalid values)
+    let mut config = Config::from_env().context("Invalid configuration")?;
+
+    // STEP 3: Apply CLI overrides (CLI > env > default)
     if let Some(rpc) = cli.rpc {
-        cfg.rpc_url = rpc;
+        config.rpc_url = rpc;
     }
     if let Some(geyser) = cli.geyser {
-        cfg.geyser_url = Some(geyser);
+        config.geyser_url = Some(geyser);
     }
 
-    let keypair_path = cli.keypair.unwrap_or_else(default_keypair_path);
-    let identity = Arc::new(read_keypair_file(&keypair_path).map_err(|e| {
+    let keypair_path = match cli.keypair {
+        Some(p) => p,
+        None => {
+            let base = dirs::home_dir()
+                .or_else(|| std::env::current_dir().ok())
+                .ok_or_else(|| anyhow::anyhow!("Cannot determine home or current directory"))?;
+            base.join(".config/solana/id.json")
+        }
+    };
+    let identity = read_keypair_file(&keypair_path).map_err(|e| {
         anyhow::anyhow!(
-            "failed to load keypair from {:?}: {}. use --keypair to specify path",
+            "Failed to load keypair from {:?}: {}. Use --keypair to specify path.",
             keypair_path,
             e
         )
-    })?);
+    })?;
+    info!("Identity: {}", identity.pubkey());
 
+    // STEP 4: Initialize Shield (blocklist protection)
+    info!("Initializing Shield (blocklist protection)...");
     let shield_manager = Arc::new(BlocklistManager::from_env());
+
+    // Load local blocklist synchronously (fast boot with protection)
     let loaded_count = shield_manager.load_local().await;
     if loaded_count > 0 {
-        println!("shield active with {} blocked validators", loaded_count);
+        info!("Shield: Active with {} blocked validators", loaded_count);
     } else {
-        println!("shield local blocklist empty or missing");
+        warn!("Shield: No local blocklist found. Will fetch from remote.");
     }
+
+    // Spawn background updater (hourly refresh from remote)
     let _shield_updater = shield_manager.clone().spawn_updater();
 
-    match cli.command {
-        Commands::Monitor => {
-            monitor_loop(
-                &cfg,
-                &keypair_path.display().to_string(),
-                Arc::clone(&identity),
-                shield_manager.get_handle(),
-            )
-            .await?
+    // STEP 5: Initialize Cartographer (cluster map + leader schedule)
+    info!("Initializing Cartographer with RPC: {}", config.rpc_url);
+    let cartographer = Arc::new(Cartographer::new(
+        config.rpc_url.clone(),
+        shield_manager.get_handle(),
+    ));
+    cartographer.refresh_topology().await?; // Fetch validator pubkey -> QUIC socket map
+    cartographer.update_schedule().await?; // Fetch leader schedule for current epoch
+
+    // STEP 6: Initialize Clock (Geyser hybrid vs RPC polling mode)
+    if let Some(ref url) = config.geyser_url {
+        info!("MODE: HYBRID (RPC Map + Geyser Clock)");
+        info!("   Geyser Endpoint: {}", url);
+        // Use Yellowstone Geyser for real-time slot updates (lowest latency)
+        let startup_rx = spawn_geyser_monitor(
+            url.clone(),
+            cartographer.clone(),
+            config.geyser_reconnect_delay(),
+            config.geyser_max_reconnect_delay(),
+        );
+
+        // Wait up to 10 seconds for initial connection, then continue regardless
+        match tokio::time::timeout(Duration::from_secs(10), startup_rx).await {
+            Ok(Ok(Ok(()))) => {
+                info!("Geyser: Initial connection established.");
+            }
+            Ok(Ok(Err(e))) => {
+                warn!(
+                    "Geyser: Initial connection failed: {}. Continuing with background retries.",
+                    e
+                );
+            }
+            Ok(Err(_)) => {
+                warn!("Geyser: Startup signal lost. Continuing with background retries.");
+            }
+            Err(_) => {
+                warn!(
+                    "Geyser: Connection timed out after 10s. Continuing with background retries."
+                );
+            }
         }
+    } else {
+        info!("MODE: LEGACY (RPC Polling)");
+        info!("   (Geyser URL not found in .env or args. Using fallback.)");
+        // Fall back to RPC polling for slot updates
+        let cart_clone = cartographer.clone();
+        let poll_interval = config.rpc_poll_interval();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = cart_clone.fetch_rpc_slot().await {
+                    debug!("RPC slot fetch failed: {}", e);
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+        });
+    }
+
+    // STEP 7: Initialize QUIC Engine with client certificate
+    info!("Initializing Engine...");
+    let engine = Arc::new(QuicEngine::new(&identity, &config)?);
+
+    // STEP 8: Start Scout (pre-warm connections to upcoming leaders)
+    let cart_clone = cartographer.clone();
+    let engine_clone = engine.clone();
+    let scout_interval = config.scout_interval();
+    let lookahead = config.scout_lookahead_slots;
+    tokio::spawn(async move {
+        loop {
+            let current_slot = cart_clone.get_known_slot();
+            if current_slot > 0 {
+                // Get unique upcoming leader IPs to pre-warm
+                let upcoming = cart_clone
+                    .get_upcoming_leaders(current_slot, lookahead)
+                    .await;
+                for target in upcoming {
+                    debug!("Scout: Warming up connection to {}", target);
+                    // Pre-warm connections (best-effort, failures logged but not fatal)
+                    if let Err(e) = engine_clone.get_connection_handle(target).await {
+                        debug!("Scout: Failed to warm connection to {}: {}", target, e);
+                    }
+                }
+            }
+            tokio::time::sleep(scout_interval).await;
+        }
+    });
+
+    match cli.command {
+        Commands::Monitor => monitor_loop(cartographer, config.monitor_interval()).await,
         Commands::Fire {
             recipient,
             priority_fee,
         } => {
             let to = parse_recipient(recipient, &identity)?;
-            let fee = priority_fee.unwrap_or(cfg.default_priority_fee);
-            fire_transaction(&cfg, &identity, to, fee, shield_manager.get_handle()).await?;
+            let fee = priority_fee.unwrap_or(config.default_priority_fee);
+            fire_transaction(&cartographer, &engine, &identity, to, fee, &config).await?;
         }
         Commands::Spam {
             count,
@@ -108,243 +209,149 @@ async fn main() -> anyhow::Result<()> {
             priority_fee,
         } => {
             let to = parse_recipient(recipient, &identity)?;
-            let fee = priority_fee.unwrap_or(cfg.default_priority_fee);
-            spam_transactions(&cfg, &identity, to, count, fee, shield_manager.get_handle()).await?;
+            let fee = priority_fee.unwrap_or(config.default_priority_fee);
+            spam_transactions(&cartographer, &engine, &identity, to, count, fee, &config).await?;
         }
     }
 
     Ok(())
 }
 
-async fn monitor_loop(
-    cfg: &Config,
-    keypair_path: &str,
-    identity: Arc<Keypair>,
-    blocklist: slipstream_net::blocklist::BlocklistHandle,
-) -> anyhow::Result<()> {
-    println!("[monitor] starting");
-    println!("rpc: {}", cfg.rpc_url);
-    println!("geyser: {}", cfg.geyser_url.as_deref().unwrap_or("<none>"));
-    println!("keypair: {keypair_path}");
-
-    let cartographer = Arc::new(Cartographer::new(cfg.rpc_url.clone(), blocklist));
-    cartographer
-        .refresh_topology()
-        .await
-        .context("failed to refresh topology")?;
-    cartographer
-        .update_schedule()
-        .await
-        .context("failed to load leader schedule")?;
-
-    if let Some(url) = cfg.geyser_url.clone() {
-        let startup_rx = spawn_geyser_monitor(
-            url,
-            Arc::clone(&cartographer),
-            cfg.geyser_reconnect_delay(),
-            cfg.geyser_max_reconnect_delay(),
-        );
-
-        match tokio::time::timeout(Duration::from_secs(10), startup_rx).await {
-            Ok(Ok(Ok(()))) => println!("mode: hybrid (rpc map + geyser clock)"),
-            Ok(Ok(Err(e))) => {
-                println!("geyser startup failed: {}. using rpc polling fallback", e);
-                spawn_rpc_slot_poller(Arc::clone(&cartographer), cfg.rpc_poll_interval());
-            }
-            Ok(Err(_)) => {
-                println!("geyser startup signal lost. using rpc polling fallback");
-                spawn_rpc_slot_poller(Arc::clone(&cartographer), cfg.rpc_poll_interval());
-            }
-            Err(_) => {
-                println!("geyser startup timed out. using rpc polling fallback");
-                spawn_rpc_slot_poller(Arc::clone(&cartographer), cfg.rpc_poll_interval());
-            }
-        }
-    } else {
-        println!("mode: legacy (rpc polling)");
-        spawn_rpc_slot_poller(Arc::clone(&cartographer), cfg.rpc_poll_interval());
-    }
-
-    let scout_interval = cfg.scout_interval();
-    let scout_lookahead_slots = cfg.scout_lookahead_slots;
-
-    {
-        let c = Arc::clone(&cartographer);
-        let engine = Arc::new(QuicEngine::new(&identity)?);
-        tokio::spawn(async move {
-            loop {
-                let slot = c.get_known_slot();
-                if slot > 0 {
-                    let upcoming = c.get_upcoming_leaders(slot, scout_lookahead_slots).await;
-                    for target in upcoming {
-                        let _ = engine.get_connection_handle(target).await;
-                    }
-                }
-                tokio::time::sleep(scout_interval).await;
-            }
-        });
-    }
-
-    loop {
-        let slot = cartographer.get_known_slot();
-        if slot == 0 {
-            println!("slot: loading...");
-        } else if let Some(target) = cartographer.get_target(slot).await {
-            println!("slot: {slot} | leader: {target}");
-        } else {
-            println!("slot: {slot} | leader: <unknown>");
-        }
-
-        tokio::time::sleep(cfg.monitor_interval()).await;
-    }
-}
-
-fn spawn_rpc_slot_poller(cartographer: Arc<Cartographer>, poll_interval: Duration) {
-    tokio::spawn(async move {
-        loop {
-            let _ = cartographer.fetch_rpc_slot().await;
-            tokio::time::sleep(poll_interval).await;
-        }
-    });
-}
-
-async fn fire_transaction(
-    cfg: &Config,
-    identity: &Arc<Keypair>,
-    recipient: Pubkey,
-    priority_fee: u64,
-    blocklist: slipstream_net::blocklist::BlocklistHandle,
-) -> anyhow::Result<()> {
-    let cartographer = Arc::new(Cartographer::new(cfg.rpc_url.clone(), blocklist));
-    cartographer
-        .refresh_topology()
-        .await
-        .context("failed to refresh topology")?;
-    cartographer
-        .update_schedule()
-        .await
-        .context("failed to load leader schedule")?;
-
-    let slot = cartographer.get_known_slot();
-    let target = cartographer
-        .get_target(slot)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no leader found for slot {}", slot))?;
-
-    let rpc = solana_client::nonblocking::rpc_client::RpcClient::new(cfg.rpc_url.clone());
-    let latest_blockhash = rpc.get_latest_blockhash().await?;
-
-    let instructions = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(cfg.default_compute_unit_limit),
-        ComputeBudgetInstruction::set_compute_unit_price(priority_fee),
-        system_instruction::transfer(&identity.pubkey(), &recipient, 1),
-    ];
-
-    let tx = Transaction::new_signed_with_payer(
-        &instructions,
-        Some(&identity.pubkey()),
-        &[identity.as_ref()],
-        latest_blockhash,
-    );
-
-    let tx_bytes = bincode::serialize(&tx)?;
-
-    let engine = QuicEngine::new(identity)?;
-    engine.send_transaction(target, tx_bytes).await?;
-
-    let sig = tx
-        .signatures
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("transaction has no signatures"))?;
-    println!("sent tx to {target} | signature: {sig}");
-    Ok(())
-}
-
-async fn spam_transactions(
-    cfg: &Config,
-    identity: &Arc<Keypair>,
-    recipient: Pubkey,
-    count: u64,
-    priority_fee: u64,
-    blocklist: slipstream_net::blocklist::BlocklistHandle,
-) -> anyhow::Result<()> {
-    let cartographer = Arc::new(Cartographer::new(cfg.rpc_url.clone(), blocklist));
-    cartographer
-        .refresh_topology()
-        .await
-        .context("failed to refresh topology")?;
-    cartographer
-        .update_schedule()
-        .await
-        .context("failed to load leader schedule")?;
-
-    let slot = cartographer.get_known_slot();
-    let target = cartographer
-        .get_target(slot)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no leader found for slot {}", slot))?;
-
-    let rpc = solana_client::nonblocking::rpc_client::RpcClient::new(cfg.rpc_url.clone());
-    let latest_blockhash = rpc.get_latest_blockhash().await?;
-
-    let instructions = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(cfg.default_compute_unit_limit),
-        ComputeBudgetInstruction::set_compute_unit_price(priority_fee),
-        system_instruction::transfer(&identity.pubkey(), &recipient, 1),
-    ];
-
-    let tx = Transaction::new_signed_with_payer(
-        &instructions,
-        Some(&identity.pubkey()),
-        &[identity.as_ref()],
-        latest_blockhash,
-    );
-    let tx_bytes = bincode::serialize(&tx)?;
-
-    let engine = QuicEngine::new(identity)?;
-    let connection = engine.get_connection_handle(target).await?;
-
-    let mut sent = 0_u64;
-    let mut failed = 0_u64;
-
-    for i in 0..count {
-        match connection.open_uni().await {
-            Ok(mut stream) => {
-                if let Err(e) = stream.write_all(&tx_bytes).await {
-                    eprintln!("stream write failed (tx {}): {}", i, e);
-                    failed += 1;
-                    continue;
-                }
-                if let Err(e) = stream.finish() {
-                    eprintln!("stream finish failed (tx {}): {}", i, e);
-                    failed += 1;
-                    continue;
-                }
-                sent += 1;
-            }
-            Err(e) => {
-                eprintln!("open stream failed (tx {}): {}", i, e);
-                failed += 1;
-            }
-        }
-    }
-
-    println!(
-        "spam complete | target: {target} | requested: {count} | sent: {sent} | failed: {failed}"
-    );
-    Ok(())
-}
-
-fn parse_recipient(recipient: Option<String>, identity: &Arc<Keypair>) -> anyhow::Result<Pubkey> {
+/// Parse recipient pubkey from CLI arg, defaulting to identity pubkey.
+fn parse_recipient(recipient: Option<String>, identity: &Keypair) -> anyhow::Result<Pubkey> {
     match recipient {
         Some(s) => s
             .parse()
-            .map_err(|_| anyhow::anyhow!("invalid recipient pubkey: {}", s)),
+            .map_err(|_| anyhow::anyhow!("Invalid recipient pubkey: '{}'. Expected base58.", s)),
         None => Ok(identity.pubkey()),
     }
 }
 
-fn default_keypair_path() -> PathBuf {
-    let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join(".config/solana/id.json")
+async fn monitor_loop(cartographer: Arc<Cartographer>, interval: std::time::Duration) {
+    info!("Starting Monitor Mode...");
+    loop {
+        let slot = cartographer.get_known_slot();
+        if slot > 0 {
+            if let Some(target) = cartographer.get_target(slot).await {
+                println!("Slot: {} | Leader IP: {}", slot, target);
+            } else {
+                println!("Slot: {} | Leader IP: UNKNOWN", slot);
+            }
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn fire_transaction(
+    cartographer: &Cartographer,
+    engine: &QuicEngine,
+    identity: &Keypair,
+    recipient: Pubkey,
+    priority_fee: u64,
+    config: &Config,
+) -> anyhow::Result<()> {
+    // Get fresh blockhash for transaction
+    let rpc = cartographer.rpc_client();
+    let latest_blockhash = rpc.get_latest_blockhash().await?;
+
+    // Build transaction: compute budget + priority fee + transfer
+    let instructions = vec![
+        ComputeBudgetInstruction::set_compute_unit_limit(config.default_compute_unit_limit),
+        ComputeBudgetInstruction::set_compute_unit_price(priority_fee),
+        system_instruction::transfer(&identity.pubkey(), &recipient, 1),
+    ];
+
+    let tx = Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&identity.pubkey()),
+        &[identity],
+        latest_blockhash,
+    );
+    let tx_bytes = bincode::serialize(&tx)?;
+
+    // Resolve current leader and send via QUIC
+    let slot = cartographer.get_known_slot();
+    if let Some(addr) = cartographer.get_target(slot).await {
+        info!("Target: {}. Firing (Fee: {})...", addr, priority_fee);
+        engine.send_transaction(addr, tx_bytes).await?;
+        let sig = tx
+            .signatures
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Transaction has no signatures"))?;
+        info!("Sent! Sig: {}", sig);
+    } else {
+        error!("No leader found for slot {}", slot);
+    }
+    Ok(())
+}
+
+async fn spam_transactions(
+    cartographer: &Cartographer,
+    engine: &QuicEngine,
+    identity: &Keypair,
+    recipient: Pubkey,
+    count: u64,
+    priority_fee: u64,
+    config: &Config,
+) -> anyhow::Result<()> {
+    // Build transaction once (reused for all sends)
+    let rpc = cartographer.rpc_client();
+    let latest_blockhash = rpc.get_latest_blockhash().await?;
+
+    // Build transaction: compute budget + priority fee + transfer
+    let instructions = vec![
+        ComputeBudgetInstruction::set_compute_unit_limit(config.default_compute_unit_limit),
+        ComputeBudgetInstruction::set_compute_unit_price(priority_fee),
+        system_instruction::transfer(&identity.pubkey(), &recipient, 1),
+    ];
+
+    let tx = Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&identity.pubkey()),
+        &[identity],
+        latest_blockhash,
+    );
+    let tx_bytes = bincode::serialize(&tx)?;
+
+    // Lock onto current leader and get connection handle
+    let slot = cartographer.get_known_slot();
+    let target = cartographer
+        .get_target(slot)
+        .await
+        .ok_or(anyhow::anyhow!("No leader found"))?;
+
+    info!("Target Locked: {}", target);
+    let connection = engine.get_connection_handle(target).await?; // Handshake once
+    info!("Pipe Open. Firing {} rounds.", count);
+
+    // Sequential fire: send transactions one at a time to prevent UDP packet fragmentation
+    // Each transaction completes as an atomic packet before the next starts
+    let mut success_count: u64 = 0;
+    let mut fail_count: u64 = 0;
+    for i in 0..count {
+        match connection.open_uni().await {
+            Ok(mut stream) => {
+                if let Err(e) = stream.write_all(&tx_bytes).await {
+                    warn!("Stream write failed (tx {}): {}", i, e);
+                    fail_count += 1;
+                    continue;
+                }
+                if let Err(e) = stream.finish() {
+                    warn!("Stream finish failed (tx {}): {}", i, e);
+                    fail_count += 1;
+                    continue;
+                }
+                success_count += 1;
+            }
+            Err(e) => {
+                warn!("Failed to open stream (tx {}): {}", i, e);
+                fail_count += 1;
+            }
+        }
+    }
+    info!(
+        "Firing Complete. Sent: {}, Failed: {}",
+        success_count, fail_count
+    );
+    Ok(())
 }
