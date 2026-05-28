@@ -9,22 +9,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::blocklist::BlocklistHandle;
+
 pub struct Cartographer {
     rpc: Arc<RpcClient>,
     node_map: Arc<RwLock<HashMap<Pubkey, SocketAddr>>>,
     schedule: Arc<RwLock<HashMap<u64, Pubkey>>>,
     current_slot: Arc<AtomicU64>,
     current_epoch: Arc<AtomicU64>,
+    blocklist: BlocklistHandle,
 }
 
 impl Cartographer {
-    pub fn new(rpc_url: String) -> Self {
+    pub fn new(rpc_url: String, blocklist: BlocklistHandle) -> Self {
         Self {
             rpc: Arc::new(RpcClient::new(rpc_url)),
             node_map: Arc::new(RwLock::new(HashMap::new())),
             schedule: Arc::new(RwLock::new(HashMap::new())),
             current_slot: Arc::new(AtomicU64::new(0)),
             current_epoch: Arc::new(AtomicU64::new(0)),
+            blocklist,
         }
     }
 
@@ -42,6 +46,13 @@ impl Cartographer {
             schedule.get(&slot).cloned()?
         };
 
+        {
+            let blocklist = self.blocklist.read().await;
+            if blocklist.contains(&leader) {
+                return None;
+            }
+        }
+
         let map = self.node_map.read().await;
         map.get(&leader).copied()
     }
@@ -49,11 +60,15 @@ impl Cartographer {
     pub async fn get_upcoming_leaders(&self, current_slot: u64, lookahead: u64) -> Vec<SocketAddr> {
         let schedule = self.schedule.read().await;
         let node_map = self.node_map.read().await;
+        let blocklist = self.blocklist.read().await;
 
         let mut out = Vec::new();
         for i in 1..=lookahead {
             let slot = current_slot + i;
             if let Some(pubkey) = schedule.get(&slot) {
+                if blocklist.contains(pubkey) {
+                    continue;
+                }
                 if let Some(addr) = node_map.get(pubkey) {
                     if !out.contains(addr) {
                         out.push(*addr);
@@ -142,10 +157,19 @@ impl Cartographer {
 #[cfg(test)]
 mod tests {
     use super::Cartographer;
+    use crate::blocklist::BlocklistHandle;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn empty_blocklist() -> BlocklistHandle {
+        Arc::new(RwLock::new(HashSet::new()))
+    }
 
     #[test]
     fn slot_clock_basics() {
-        let cartographer = Cartographer::new("http://localhost:8899".to_string());
+        let cartographer =
+            Cartographer::new("http://localhost:8899".to_string(), empty_blocklist());
         assert_eq!(cartographer.get_known_slot(), 0);
         cartographer.update_slot(42);
         assert_eq!(cartographer.get_known_slot(), 42);

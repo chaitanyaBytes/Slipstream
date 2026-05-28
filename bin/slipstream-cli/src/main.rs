@@ -2,7 +2,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
 use slipstream_common::Config;
-use slipstream_net::{spawn_geyser_monitor, Cartographer, QuicEngine};
+use slipstream_net::{spawn_geyser_monitor, BlocklistManager, Cartographer, QuicEngine};
 #[allow(deprecated)]
 use solana_sdk::{
     compute_budget::ComputeBudgetInstruction,
@@ -75,12 +75,22 @@ async fn main() -> anyhow::Result<()> {
         )
     })?);
 
+    let shield_manager = Arc::new(BlocklistManager::from_env());
+    let loaded_count = shield_manager.load_local().await;
+    if loaded_count > 0 {
+        println!("shield active with {} blocked validators", loaded_count);
+    } else {
+        println!("shield local blocklist empty or missing");
+    }
+    let _shield_updater = shield_manager.clone().spawn_updater();
+
     match cli.command {
         Commands::Monitor => {
             monitor_loop(
                 &cfg,
                 &keypair_path.display().to_string(),
                 Arc::clone(&identity),
+                shield_manager.get_handle(),
             )
             .await?
         }
@@ -90,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let to = parse_recipient(recipient, &identity)?;
             let fee = priority_fee.unwrap_or(cfg.default_priority_fee);
-            fire_transaction(&cfg, &identity, to, fee).await?;
+            fire_transaction(&cfg, &identity, to, fee, shield_manager.get_handle()).await?;
         }
         Commands::Spam {
             count,
@@ -99,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let to = parse_recipient(recipient, &identity)?;
             let fee = priority_fee.unwrap_or(cfg.default_priority_fee);
-            spam_transactions(&cfg, &identity, to, count, fee).await?;
+            spam_transactions(&cfg, &identity, to, count, fee, shield_manager.get_handle()).await?;
         }
     }
 
@@ -110,13 +120,14 @@ async fn monitor_loop(
     cfg: &Config,
     keypair_path: &str,
     identity: Arc<Keypair>,
+    blocklist: slipstream_net::blocklist::BlocklistHandle,
 ) -> anyhow::Result<()> {
     println!("[monitor] starting");
     println!("rpc: {}", cfg.rpc_url);
     println!("geyser: {}", cfg.geyser_url.as_deref().unwrap_or("<none>"));
     println!("keypair: {keypair_path}");
 
-    let cartographer = Arc::new(Cartographer::new(cfg.rpc_url.clone()));
+    let cartographer = Arc::new(Cartographer::new(cfg.rpc_url.clone(), blocklist));
     cartographer
         .refresh_topology()
         .await
@@ -202,8 +213,9 @@ async fn fire_transaction(
     identity: &Arc<Keypair>,
     recipient: Pubkey,
     priority_fee: u64,
+    blocklist: slipstream_net::blocklist::BlocklistHandle,
 ) -> anyhow::Result<()> {
-    let cartographer = Arc::new(Cartographer::new(cfg.rpc_url.clone()));
+    let cartographer = Arc::new(Cartographer::new(cfg.rpc_url.clone(), blocklist));
     cartographer
         .refresh_topology()
         .await
@@ -254,8 +266,9 @@ async fn spam_transactions(
     recipient: Pubkey,
     count: u64,
     priority_fee: u64,
+    blocklist: slipstream_net::blocklist::BlocklistHandle,
 ) -> anyhow::Result<()> {
-    let cartographer = Arc::new(Cartographer::new(cfg.rpc_url.clone()));
+    let cartographer = Arc::new(Cartographer::new(cfg.rpc_url.clone(), blocklist));
     cartographer
         .refresh_topology()
         .await
