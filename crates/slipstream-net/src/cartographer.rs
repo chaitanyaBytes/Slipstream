@@ -158,7 +158,9 @@ impl Cartographer {
 mod tests {
     use super::Cartographer;
     use crate::blocklist::BlocklistHandle;
+    use solana_sdk::pubkey::Pubkey;
     use std::collections::HashSet;
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -173,5 +175,49 @@ mod tests {
         assert_eq!(cartographer.get_known_slot(), 0);
         cartographer.update_slot(42);
         assert_eq!(cartographer.get_known_slot(), 42);
+    }
+
+    #[tokio::test]
+    async fn shield_blocks_target_lookup() {
+        let blocked = Pubkey::new_unique();
+        let addr: SocketAddr = "1.1.1.1:8003".parse().unwrap();
+        let blocklist: BlocklistHandle = Arc::new(RwLock::new(HashSet::from([blocked])));
+        let c = Cartographer::new("http://localhost:8899".to_string(), blocklist);
+
+        {
+            let mut sched = c.schedule.write().await;
+            sched.insert(10, blocked);
+        }
+        {
+            let mut nodes = c.node_map.write().await;
+            nodes.insert(blocked, addr);
+        }
+
+        assert_eq!(c.get_target(10).await, None);
+    }
+
+    #[tokio::test]
+    async fn scout_skips_blocked_leaders() {
+        let blocked = Pubkey::new_unique();
+        let allowed = Pubkey::new_unique();
+        let blocked_addr: SocketAddr = "1.1.1.1:8003".parse().unwrap();
+        let allowed_addr: SocketAddr = "2.2.2.2:8003".parse().unwrap();
+        let blocklist: BlocklistHandle = Arc::new(RwLock::new(HashSet::from([blocked])));
+        let c = Cartographer::new("http://localhost:8899".to_string(), blocklist);
+
+        {
+            let mut sched = c.schedule.write().await;
+            sched.insert(101, blocked);
+            sched.insert(102, allowed);
+        }
+        {
+            let mut nodes = c.node_map.write().await;
+            nodes.insert(blocked, blocked_addr);
+            nodes.insert(allowed, allowed_addr);
+        }
+
+        let targets = c.get_upcoming_leaders(100, 5).await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0], allowed_addr);
     }
 }

@@ -195,3 +195,41 @@ impl Default for BlocklistManager {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_blocklist_skips_invalid_and_comments() {
+        let manager = BlocklistManager::new();
+        let content = r#"
+            # comment
+            11111111111111111111111111111112
+            invalid_key
+            So11111111111111111111111111111111111111112
+        "#;
+
+        let keys = manager.parse_blocklist(content);
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn parse_empty_blocklist() {
+        let manager = BlocklistManager::new();
+        let keys = manager.parse_blocklist("");
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn from_env_defaults() {
+        std::env::remove_var("SLIPSTREAM_BLOCKLIST_FILE");
+        std::env::remove_var("SLIPSTREAM_BLOCKLIST_URL");
+        std::env::remove_var("SLIPSTREAM_BLOCKLIST_REFRESH_SECS");
+
+        let manager = BlocklistManager::from_env();
+        assert_eq!(manager.local_path, PathBuf::from("./blocklist.txt"));
+        assert!(manager.remote_url.is_none());
+        assert_eq!(manager.refresh_interval, DEFAULT_REFRESH_INTERVAL);
+    }
+}
