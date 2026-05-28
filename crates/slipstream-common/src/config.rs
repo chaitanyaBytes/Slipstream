@@ -99,3 +99,76 @@ fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
         .and_then(|v| v.parse::<T>().ok())
         .unwrap_or(default)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn clear_env_vars() {
+        env::remove_var("SOLANA_RPC_URL");
+        env::remove_var("GEYSER_URL");
+        env::remove_var("RPC_POLL_INTERVAL_MS");
+        env::remove_var("SCOUT_INTERVAL_MS");
+        env::remove_var("MONITOR_INTERVAL_MS");
+        env::remove_var("DEFAULT_COMPUTE_UNIT_LIMIT");
+        env::remove_var("GEYSER_RECONNECT_DELAY_MS");
+        env::remove_var("GEYSER_MAX_RECONNECT_DELAY_MS");
+    }
+
+    #[test]
+    fn config_defaults() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let cfg = Config::from_env().expect("default config should be valid");
+        assert_eq!(cfg.rpc_url, "https://api.mainnet-beta.solana.com");
+        assert!(cfg.geyser_url.is_none());
+        assert_eq!(cfg.rpc_poll_interval_ms, 400);
+        assert_eq!(cfg.scout_interval_ms, 1000);
+        assert_eq!(cfg.default_compute_unit_limit, 200_000);
+    }
+
+    #[test]
+    fn validation_interval_too_low() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        env::set_var("RPC_POLL_INTERVAL_MS", "10");
+        let result = Config::from_env();
+        env::remove_var("RPC_POLL_INTERVAL_MS");
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must be >="));
+    }
+
+    #[test]
+    fn validation_zero_compute_units() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        env::set_var("DEFAULT_COMPUTE_UNIT_LIMIT", "0");
+        let result = Config::from_env();
+        env::remove_var("DEFAULT_COMPUTE_UNIT_LIMIT");
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must be > 0"));
+    }
+
+    #[test]
+    fn validation_geyser_backoff_order() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        env::set_var("GEYSER_RECONNECT_DELAY_MS", "10000");
+        env::set_var("GEYSER_MAX_RECONNECT_DELAY_MS", "1000");
+        let result = Config::from_env();
+        env::remove_var("GEYSER_RECONNECT_DELAY_MS");
+        env::remove_var("GEYSER_MAX_RECONNECT_DELAY_MS");
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must be >="));
+    }
+}
