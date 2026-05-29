@@ -1,7 +1,7 @@
 use crate::cartographer::Cartographer;
 use http::Uri;
 use log::{error, info};
-use slipstream_common::SlipstreamError;
+use slipstream_common::{Metrics, SlipstreamError};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -147,6 +147,7 @@ pub fn spawn_geyser_monitor(
     cartographer: Arc<Cartographer>,
     initial_delay: Duration,
     max_delay: Duration,
+    metrics: Arc<Metrics>,
 ) -> oneshot::Receiver<Result<(), SlipstreamError>> {
     let (startup_tx, startup_rx) = oneshot::channel();
 
@@ -167,6 +168,7 @@ pub fn spawn_geyser_monitor(
                     }
 
                     if let Err(e) = listener.start_tracking().await {
+                        metrics.inc_geyser_reconnects();
                         error!(
                             "Geyser Stream Error: {}. Reconnecting in {:?}...",
                             e, retry_delay
@@ -174,6 +176,7 @@ pub fn spawn_geyser_monitor(
                     }
                 }
                 Err(e) => {
+                    metrics.inc_geyser_reconnects();
                     // Signal startup failure (once)
                     if let Some(tx) = startup_tx.take() {
                         let _ = tx.send(Err(SlipstreamError::GeyserError(e.to_string())));

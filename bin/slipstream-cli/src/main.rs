@@ -2,7 +2,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
 use log::{debug, error, info, warn};
-use slipstream_common::Config;
+use slipstream_common::{Config, Metrics};
 use slipstream_net::{
     blocklist::BlocklistManager, cartographer::Cartographer, engine::QuicEngine,
     geyser::spawn_geyser_monitor,
@@ -18,11 +18,12 @@ use solana_sdk::{
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing_log::LogTracer;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "slipstream")]
 struct Cli {
-    // Optional Override via Command Line
     #[arg(short, long)]
     rpc: Option<String>,
 
@@ -57,16 +58,14 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // STEP 1: Load environment variables and initialize logging
     dotenv().ok();
-    env_logger::init();
+    init_tracing()?;
 
+    let metrics = Arc::new(Metrics::default());
     let cli = Cli::parse();
 
-    // STEP 2: Load and validate config (fail-fast on invalid values)
     let mut config = Config::from_env().context("Invalid configuration")?;
 
-    // STEP 3: Apply CLI overrides (CLI > env > default)
     if let Some(rpc) = cli.rpc {
         config.rpc_url = rpc;
     }
@@ -92,11 +91,9 @@ async fn main() -> anyhow::Result<()> {
     })?;
     info!("Identity: {}", identity.pubkey());
 
-    // STEP 4: Initialize Shield (blocklist protection)
     info!("Initializing Shield (blocklist protection)...");
     let shield_manager = Arc::new(BlocklistManager::from_env());
 
-    // Load local blocklist synchronously (fast boot with protection)
     let loaded_count = shield_manager.load_local().await;
     if loaded_count > 0 {
         info!("Shield: Active with {} blocked validators", loaded_count);
@@ -104,31 +101,27 @@ async fn main() -> anyhow::Result<()> {
         warn!("Shield: No local blocklist found. Will fetch from remote.");
     }
 
-    // Spawn background updater (hourly refresh from remote)
     let _shield_updater = shield_manager.clone().spawn_updater();
 
-    // STEP 5: Initialize Cartographer (cluster map + leader schedule)
     info!("Initializing Cartographer with RPC: {}", config.rpc_url);
     let cartographer = Arc::new(Cartographer::new(
         config.rpc_url.clone(),
         shield_manager.get_handle(),
     ));
-    cartographer.refresh_topology().await?; // Fetch validator pubkey -> QUIC socket map
-    cartographer.update_schedule().await?; // Fetch leader schedule for current epoch
+    cartographer.refresh_topology().await?;
+    cartographer.update_schedule().await?;
 
-    // STEP 6: Initialize Clock (Geyser hybrid vs RPC polling mode)
     if let Some(ref url) = config.geyser_url {
         info!("MODE: HYBRID (RPC Map + Geyser Clock)");
         info!("   Geyser Endpoint: {}", url);
-        // Use Yellowstone Geyser for real-time slot updates (lowest latency)
         let startup_rx = spawn_geyser_monitor(
             url.clone(),
             cartographer.clone(),
             config.geyser_reconnect_delay(),
             config.geyser_max_reconnect_delay(),
+            Arc::clone(&metrics),
         );
 
-        // Wait up to 10 seconds for initial connection, then continue regardless
         match tokio::time::timeout(Duration::from_secs(10), startup_rx).await {
             Ok(Ok(Ok(()))) => {
                 info!("Geyser: Initial connection established.");
@@ -138,20 +131,22 @@ async fn main() -> anyhow::Result<()> {
                     "Geyser: Initial connection failed: {}. Continuing with background retries.",
                     e
                 );
+                metrics.inc_geyser_reconnects();
             }
             Ok(Err(_)) => {
                 warn!("Geyser: Startup signal lost. Continuing with background retries.");
+                metrics.inc_geyser_reconnects();
             }
             Err(_) => {
                 warn!(
                     "Geyser: Connection timed out after 10s. Continuing with background retries."
                 );
+                metrics.inc_geyser_reconnects();
             }
         }
     } else {
         info!("MODE: LEGACY (RPC Polling)");
         info!("   (Geyser URL not found in .env or args. Using fallback.)");
-        // Fall back to RPC polling for slot updates
         let cart_clone = cartographer.clone();
         let poll_interval = config.rpc_poll_interval();
         tokio::spawn(async move {
@@ -164,11 +159,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // STEP 7: Initialize QUIC Engine with client certificate
     info!("Initializing Engine...");
     let engine = Arc::new(QuicEngine::new(&identity, &config)?);
 
-    // STEP 8: Start Scout (pre-warm connections to upcoming leaders)
     let cart_clone = cartographer.clone();
     let engine_clone = engine.clone();
     let scout_interval = config.scout_interval();
@@ -177,13 +170,11 @@ async fn main() -> anyhow::Result<()> {
         loop {
             let current_slot = cart_clone.get_known_slot();
             if current_slot > 0 {
-                // Get unique upcoming leader IPs to pre-warm
                 let upcoming = cart_clone
                     .get_upcoming_leaders(current_slot, lookahead)
                     .await;
                 for target in upcoming {
                     debug!("Scout: Warming up connection to {}", target);
-                    // Pre-warm connections (best-effort, failures logged but not fatal)
                     if let Err(e) = engine_clone.get_connection_handle(target).await {
                         debug!("Scout: Failed to warm connection to {}: {}", target, e);
                     }
@@ -194,14 +185,24 @@ async fn main() -> anyhow::Result<()> {
     });
 
     match cli.command {
-        Commands::Monitor => monitor_loop(cartographer, config.monitor_interval()).await,
+        Commands::Monitor => monitor_loop(cartographer, config.monitor_interval(), metrics).await,
         Commands::Fire {
             recipient,
             priority_fee,
         } => {
             let to = parse_recipient(recipient, &identity)?;
             let fee = priority_fee.unwrap_or(config.default_priority_fee);
-            fire_transaction(&cartographer, &engine, &identity, to, fee, &config).await?;
+            fire_transaction(
+                &cartographer,
+                &engine,
+                &identity,
+                to,
+                fee,
+                &config,
+                &metrics,
+            )
+            .await?;
+            log_metrics("fire", &metrics);
         }
         Commands::Spam {
             count,
@@ -210,14 +211,48 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let to = parse_recipient(recipient, &identity)?;
             let fee = priority_fee.unwrap_or(config.default_priority_fee);
-            spam_transactions(&cartographer, &engine, &identity, to, count, fee, &config).await?;
+            spam_transactions(
+                &cartographer,
+                &engine,
+                &identity,
+                to,
+                count,
+                fee,
+                &config,
+                &metrics,
+            )
+            .await?;
+            log_metrics("spam", &metrics);
         }
     }
 
     Ok(())
 }
 
-/// Parse recipient pubkey from CLI arg, defaulting to identity pubkey.
+fn init_tracing() -> anyhow::Result<()> {
+    let _ = LogTracer::init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .try_init()
+        .ok();
+    Ok(())
+}
+
+fn log_metrics(context: &str, metrics: &Metrics) {
+    let s = metrics.snapshot();
+    info!(
+        "Metrics [{}]: attempted={} sent={} failed={} leader_lookup_failed={} geyser_reconnects={}",
+        context,
+        s.tx_attempted,
+        s.tx_sent,
+        s.tx_failed,
+        s.leader_lookup_failed,
+        s.geyser_reconnects
+    );
+}
+
 fn parse_recipient(recipient: Option<String>, identity: &Keypair) -> anyhow::Result<Pubkey> {
     match recipient {
         Some(s) => s
@@ -227,8 +262,13 @@ fn parse_recipient(recipient: Option<String>, identity: &Keypair) -> anyhow::Res
     }
 }
 
-async fn monitor_loop(cartographer: Arc<Cartographer>, interval: std::time::Duration) {
+async fn monitor_loop(
+    cartographer: Arc<Cartographer>,
+    interval: std::time::Duration,
+    metrics: Arc<Metrics>,
+) {
     info!("Starting Monitor Mode...");
+    let mut tick: u64 = 0;
     loop {
         let slot = cartographer.get_known_slot();
         if slot > 0 {
@@ -237,6 +277,10 @@ async fn monitor_loop(cartographer: Arc<Cartographer>, interval: std::time::Dura
             } else {
                 println!("Slot: {} | Leader IP: UNKNOWN", slot);
             }
+        }
+        tick += 1;
+        if tick % 10 == 0 {
+            log_metrics("monitor", &metrics);
         }
         tokio::time::sleep(interval).await;
     }
@@ -249,12 +293,11 @@ async fn fire_transaction(
     recipient: Pubkey,
     priority_fee: u64,
     config: &Config,
+    metrics: &Metrics,
 ) -> anyhow::Result<()> {
-    // Get fresh blockhash for transaction
     let rpc = cartographer.rpc_client();
     let latest_blockhash = rpc.get_latest_blockhash().await?;
 
-    // Build transaction: compute budget + priority fee + transfer
     let instructions = vec![
         ComputeBudgetInstruction::set_compute_unit_limit(config.default_compute_unit_limit),
         ComputeBudgetInstruction::set_compute_unit_price(priority_fee),
@@ -269,17 +312,22 @@ async fn fire_transaction(
     );
     let tx_bytes = bincode::serialize(&tx)?;
 
-    // Resolve current leader and send via QUIC
+    metrics.inc_tx_attempted();
     let slot = cartographer.get_known_slot();
     if let Some(addr) = cartographer.get_target(slot).await {
         info!("Target: {}. Firing (Fee: {})...", addr, priority_fee);
-        engine.send_transaction(addr, tx_bytes).await?;
+        if let Err(e) = engine.send_transaction(addr, tx_bytes).await {
+            metrics.inc_tx_failed();
+            return Err(e.into());
+        }
+        metrics.inc_tx_sent();
         let sig = tx
             .signatures
             .first()
             .ok_or_else(|| anyhow::anyhow!("Transaction has no signatures"))?;
         info!("Sent! Sig: {}", sig);
     } else {
+        metrics.inc_leader_lookup_failed();
         error!("No leader found for slot {}", slot);
     }
     Ok(())
@@ -293,12 +341,11 @@ async fn spam_transactions(
     count: u64,
     priority_fee: u64,
     config: &Config,
+    metrics: &Metrics,
 ) -> anyhow::Result<()> {
-    // Build transaction once (reused for all sends)
     let rpc = cartographer.rpc_client();
     let latest_blockhash = rpc.get_latest_blockhash().await?;
 
-    // Build transaction: compute budget + priority fee + transfer
     let instructions = vec![
         ComputeBudgetInstruction::set_compute_unit_limit(config.default_compute_unit_limit),
         ComputeBudgetInstruction::set_compute_unit_price(priority_fee),
@@ -313,7 +360,6 @@ async fn spam_transactions(
     );
     let tx_bytes = bincode::serialize(&tx)?;
 
-    // Lock onto current leader and get connection handle
     let slot = cartographer.get_known_slot();
     let target = cartographer
         .get_target(slot)
@@ -321,31 +367,34 @@ async fn spam_transactions(
         .ok_or(anyhow::anyhow!("No leader found"))?;
 
     info!("Target Locked: {}", target);
-    let connection = engine.get_connection_handle(target).await?; // Handshake once
+    let connection = engine.get_connection_handle(target).await?;
     info!("Pipe Open. Firing {} rounds.", count);
 
-    // Sequential fire: send transactions one at a time to prevent UDP packet fragmentation
-    // Each transaction completes as an atomic packet before the next starts
     let mut success_count: u64 = 0;
     let mut fail_count: u64 = 0;
     for i in 0..count {
+        metrics.inc_tx_attempted();
         match connection.open_uni().await {
             Ok(mut stream) => {
                 if let Err(e) = stream.write_all(&tx_bytes).await {
                     warn!("Stream write failed (tx {}): {}", i, e);
                     fail_count += 1;
+                    metrics.inc_tx_failed();
                     continue;
                 }
                 if let Err(e) = stream.finish() {
                     warn!("Stream finish failed (tx {}): {}", i, e);
                     fail_count += 1;
+                    metrics.inc_tx_failed();
                     continue;
                 }
                 success_count += 1;
+                metrics.inc_tx_sent();
             }
             Err(e) => {
                 warn!("Failed to open stream (tx {}): {}", i, e);
                 fail_count += 1;
+                metrics.inc_tx_failed();
             }
         }
     }

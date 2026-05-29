@@ -1,10 +1,12 @@
 pub mod config;
 pub mod error;
 pub mod identity;
+pub mod metrics;
 
 pub use config::Config;
 pub use error::SlipstreamError;
 pub use identity::create_quic_config;
+pub use metrics::{Metrics, MetricsSnapshot};
 
 // --- UNIT TEST ---
 #[cfg(test)]
