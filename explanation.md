@@ -392,7 +392,7 @@ const ED25519_PKCS8_HEADER: &[u8] = &[
 
 ## Updates
 
-### January 15, 2026 – QUIC Stream Optimization (Anza Feedback)
+### 1. QUIC Stream Optimization (Anza Feedback)
 
 **Implemented sequential stream handling and FIFO scheduling to eliminate UDP packet fragmentation.**
 
@@ -461,7 +461,7 @@ transport_config.send_fairness(false);
 
 ---
 
-### January 13, 2026 – Slipstream Shield (Blocklist Protection)
+### 2. Slipstream Shield (Blocklist Protection)
 
 **Added validator blocklist filtering to protect against malicious validators.**
 

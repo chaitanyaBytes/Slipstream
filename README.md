@@ -142,7 +142,7 @@ slipstream/
                 └───────────────────────┘
 ```
 
-<img width="2547" height="1801" alt="Screenshot From 2026-01-07 16-27-50" src="https://github.com/user-attachments/assets/aa75ee24-39b2-4566-b5f2-cb70d717ba72" />
+<img width="1672" height="941" alt="Image" src="https://github.com/user-attachments/assets/e7d7c4cc-d808-481e-bc9b-48921c2e7d9a" />
 
 ## Validator Blocklist (Shield)
 
@@ -151,6 +151,7 @@ Slipstream Shield protects against malicious validators by filtering them from l
 ### Quick Setup
 
 1. Create `blocklist.txt` in the project root:
+
    ```bash
    # Add one validator pubkey per line
    echo "MALICIOUS_VALIDATOR_PUBKEY_HERE" >> blocklist.txt
@@ -168,6 +169,7 @@ Slipstream Shield protects against malicious validators by filtering them from l
 ### How It Works
 
 When resolving the current leader, Cartographer checks the blocklist:
+
 - If leader is blocked → returns `None` (transaction skipped)
 - If leader is clean → returns socket address (transaction sent)
 
