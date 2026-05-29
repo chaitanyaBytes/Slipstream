@@ -1,0 +1,542 @@
+# Slipstream
+
+**A high-performance Solana transaction client for ultra-low-latency transaction submission.**
+
+## Overview
+
+Slipstream bypasses traditional RPC-based transaction submission by sending transactions **directly to validator leaders over QUIC protocol**. This approach leverages Solana's stake-weighted Quality of Service (swQoS) to achieve lower latency and higher throughput compared to standard RPC submission.
+
+### Target Use Cases
+
+- **MEV Searchers** – Sub-millisecond transaction delivery for arbitrage opportunities
+- **High-Frequency Traders** – Latency-sensitive trading bots and market makers
+- **Transaction Spammers** – Rapid transaction submission with minimal overhead
+
+### Why Direct-to-Leader?
+
+When you submit a transaction via RPC, it travels through multiple hops before reaching the current slot leader. Slipstream eliminates this overhead by:
+
+1. Tracking the leader schedule in real-time
+2. Maintaining hot QUIC connections to upcoming leaders
+3. Sending transactions directly to the leader's TPU (Transaction Processing Unit) port
+
+---
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Core Components](#core-components)
+  - [1. QuicEngine](#1-quicengine-slipstream-netsrcenginers)
+  - [2. Cartographer](#2-cartographer-slipstream-netsrccartographerrs)
+  - [3. GeyserListener](#3-geyserlistener-slipstream-netsrcgeyserrs)
+  - [4. Identity](#4-identity-slipstream-commonsrcidentityrs)
+- [Clock Modes](#clock-modes)
+  - [Hybrid Mode (Recommended)](#hybrid-mode-recommended)
+  - [Legacy Mode (Fallback)](#legacy-mode-fallback)
+- [Connection Pre-warming (Scout)](#connection-pre-warming-scout)
+- [Machine Gun Mode](#machine-gun-mode)
+- [External Integrations](#external-integrations)
+- [CLI Reference](#cli-reference)
+  - [Commands](#commands)
+  - [Options](#options)
+  - [Examples](#examples)
+- [Configuration](#configuration)
+  - [Network Endpoints](#network-endpoints)
+  - [Timing Intervals](#timing-intervals)
+  - [QUIC Transport](#quic-transport)
+  - [Transaction Defaults](#transaction-defaults)
+  - [Geyser Reconnection](#geyser-reconnection)
+- [Notable Implementation Patterns](#notable-implementation-patterns)
+- [Dependencies](#dependencies)
+- [Performance Considerations](#performance-considerations)
+- [Security Notes](#security-notes)
+- [Updates](#updates)
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       slipstream-cli                          │
+│           (CLI parsing, command dispatch, runtime)          │
+└─────────────────────────────────────────────────────────────┘
+                            │
+            ┌───────────────┼───────────────┐
+            ▼               ▼               ▼
+┌───────────────────┐ ┌───────────┐ ┌─────────────────┐
+│   Cartographer    │ │  Engine   │ │ GeyserListener  │
+│ (Leader Schedule) │ │  (QUIC)   │ │ (Slot Stream)   │
+└───────────────────┘ └───────────┘ └─────────────────┘
+                            │
+                ┌───────────────────────┐
+                │    slipstream-common    │
+                │ (Config, Identity,    │
+                │  Error Types)         │
+                └───────────────────────┘
+```
+
+### Crate Responsibilities
+
+| Crate | Purpose |
+|-------|---------|
+| **slipstream-common** | Shared utilities: configuration loading, QUIC identity/certificate generation, error types |
+| **slipstream-net** | Network layer: QUIC engine, connection caching, Geyser integration, leader schedule tracking |
+| **slipstream-cli** | CLI binary: command parsing, orchestration, transaction building |
+
+---
+
+## Core Components
+
+### 1. QuicEngine (`slipstream-net/src/engine.rs`)
+
+Manages QUIC connections to validator TPU ports with automatic connection caching.
+
+**Key Features:**
+- **Lock-free connection cache** using `DashMap` for concurrent access without mutex contention
+- **Connection reuse** – avoids per-transaction handshake overhead
+- **Stream multiplexing** – multiple transactions can share a single connection
+
+**How it works:**
+```
+1. Check cache for existing connection to target validator
+2. If valid connection exists → reuse it
+3. If not → establish new QUIC connection and cache it
+4. Open unidirectional stream, write transaction bytes, close stream
+```
+
+### 2. Cartographer (`slipstream-net/src/cartographer.rs`)
+
+Maintains cluster topology and leader schedule mapping.
+
+**Responsibilities:**
+- Maps validator pubkeys to their QUIC socket addresses
+- Tracks the leader schedule (which validator leads which slot)
+- Provides slot → leader → socket address resolution
+- Uses `AtomicU64` for lock-free slot tracking
+
+**Data Flow:**
+```
+Slot Number → Leader Pubkey → QUIC Socket Address
+     ↓              ↓                  ↓
+ (schedule)     (node_map)         (engine)
+```
+
+### 3. GeyserListener (`slipstream-net/src/geyser.rs`)
+
+Real-time slot updates via Yellowstone Geyser gRPC protocol.
+
+**Why Geyser?**
+- Lower latency than RPC polling (~10-50ms faster)
+- Push-based updates vs pull-based polling
+- Minimal bandwidth (subscribes only to slot updates)
+
+**Reconnection Strategy:**
+- Exponential backoff on connection failure
+- Configurable initial delay (default: 1s) and max delay (default: 10s)
+- Automatic reconnection with state preservation
+
+### 4. Identity (`slipstream-common/src/identity.rs`)
+
+Generates QUIC client identity from Solana keypairs.
+
+**Process:**
+1. Convert Ed25519 keypair to PKCS#8 format
+2. Generate self-signed X.509 certificate
+3. Set ALPN protocol to `"solana-tpu"` (required by validators)
+4. Configure `rustls` to skip server certificate verification (validators use ephemeral certs)
+
+---
+
+## Clock Modes
+
+Slipstream supports two modes for tracking the current slot:
+
+### Hybrid Mode (Recommended)
+
+Uses **Geyser gRPC** for real-time slot updates.
+
+- **Latency**: ~10-50ms from slot confirmation
+- **Requirement**: Yellowstone Geyser endpoint (`GEYSER_URL`)
+- **Best for**: Production MEV/HFT systems
+
+### Legacy Mode (Fallback)
+
+Uses **RPC polling** for slot updates.
+
+- **Latency**: Configurable polling interval (default: 400ms)
+- **Requirement**: Standard Solana RPC endpoint
+- **Best for**: Testing or when Geyser is unavailable
+
+---
+
+## Connection Pre-warming (Scout)
+
+The Scout background task maintains hot connections to upcoming leaders:
+
+```
+┌──────────────────────────────────────────────────────┐
+│  Current Slot: 250000                                │
+│  Lookahead: 10 slots                                 │
+│                                                      │
+│  Pre-warmed connections:                             │
+│    Slot 250001 → Validator A → Connection OK        │
+│    Slot 250002 → Validator A → Connection OK        │
+│    Slot 250003 → Validator B → Connection OK        │
+│    Slot 250004 → Validator C → Connection OK        │
+│    ...                                               │
+└──────────────────────────────────────────────────────┘
+```
+
+**Benefits:**
+- Eliminates QUIC handshake latency when leader rotates
+- Connections ready before they're needed
+- Configurable lookahead (default: 10 slots)
+
+---
+
+## Machine Gun Mode
+
+For high-frequency transaction submission, Slipstream provides direct connection handles:
+
+```
+Traditional (slow):
+  TX1: Connect → Send → Close
+  TX2: Connect → Send → Close
+  TX3: Connect → Send → Close
+
+Machine Gun (fast):
+  Connect once → [TX1, TX2, TX3, ...] → Close
+```
+
+This leverages **QUIC stream multiplexing** – multiple independent streams share a single connection, avoiding per-transaction handshake overhead.
+
+---
+
+## External Integrations
+
+### 1. Solana RPC
+
+- **Purpose**: Cluster topology, leader schedule, epoch info, blockhash
+- **Crate**: `solana-client`
+- **Default**: `https://api.mainnet-beta.solana.com`
+
+### 2. Yellowstone Geyser gRPC
+
+- **Purpose**: Real-time slot updates
+- **Protocol**: gRPC over TLS with optional auth token
+- **Crate**: `yellowstone-grpc-proto`
+
+### 3. Solana TPU (QUIC)
+
+- **Purpose**: Direct transaction submission
+- **Protocol**: QUIC with TLS (Ed25519 client certificate)
+- **ALPN**: `"solana-tpu"`
+- **Crate**: `quinn`
+
+---
+
+## CLI Reference
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `monitor` | Continuously display current slot and leader IP |
+| `fire` | Send a single transaction to current leader |
+| `spam` | Send multiple transactions in rapid succession (machine gun mode) |
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `-r, --rpc <URL>` | Override RPC endpoint |
+| `--geyser <URL>` | Override Geyser gRPC endpoint |
+| `-k, --keypair <PATH>` | Path to keypair (default: `~/.config/solana/id.json`) |
+| `--recipient <PUBKEY>` | Recipient for transfer (default: self-transfer) |
+| `--priority-fee <FEE>` | Priority fee in microlamports |
+| `--count <N>` | Number of transactions (spam only) |
+
+### Examples
+
+```bash
+# Monitor current slot and leader
+slipstream-cli monitor
+
+# Send a single transaction
+slipstream-cli fire --keypair ./my-wallet.json --priority-fee 500000
+
+# Spam 100 transactions
+slipstream-cli spam --count 100 --priority-fee 1000000
+```
+
+---
+
+## Configuration
+
+All configuration is done via environment variables with sensible defaults.
+
+### Network Endpoints
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` | RPC endpoint |
+| `GEYSER_URL` | — | Yellowstone Geyser gRPC endpoint |
+
+### Timing Intervals
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RPC_POLL_INTERVAL_MS` | `400` | Slot polling interval (legacy mode) |
+| `SCOUT_INTERVAL_MS` | `1000` | Connection pre-warming interval |
+| `SCOUT_LOOKAHEAD_SLOTS` | `10` | Slots ahead to pre-warm |
+| `MONITOR_INTERVAL_MS` | `400` | Monitor display refresh rate |
+
+### QUIC Transport
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `QUIC_KEEP_ALIVE_SECS` | `5` | QUIC keep-alive interval |
+| `QUIC_IDLE_TIMEOUT_SECS` | `10` | QUIC connection idle timeout |
+
+### Transaction Defaults
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DEFAULT_COMPUTE_UNIT_LIMIT` | `200000` | Compute budget per transaction |
+| `DEFAULT_PRIORITY_FEE` | `100000` | Priority fee (microlamports) |
+
+### Geyser Reconnection
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GEYSER_RECONNECT_DELAY_MS` | `1000` | Initial reconnect delay |
+| `GEYSER_MAX_RECONNECT_DELAY_MS` | `10000` | Max reconnect delay |
+
+---
+
+## Notable Implementation Patterns
+
+### Lock-Free Slot Tracking
+
+```rust
+current_slot: Arc<AtomicU64>
+// Read: Ordering::Relaxed for maximum performance
+// Write: Atomic swap, no locks needed
+```
+
+### DashMap for Connection Cache
+
+Uses the `dashmap` crate for lock-free concurrent HashMap access, enabling multiple tasks to read/write connections without contention.
+
+### Fail-Fast Configuration
+
+All configuration values are validated at startup:
+- Minimum intervals prevent CPU spikes (50ms floor)
+- Keep-alive must be less than idle timeout
+- Compute unit limit must be > 0
+
+Invalid configuration causes immediate startup failure with descriptive error messages.
+
+### PKCS#8 Key Wrapping
+
+Manually constructs PKCS#8 envelope for Ed25519 key conversion (Solana uses raw Ed25519, rustls requires PKCS#8):
+
+```rust
+const ED25519_PKCS8_HEADER: &[u8] = &[
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
+    0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+];
+```
+
+---
+
+## Dependencies
+
+### Core Runtime
+- **tokio** – Async runtime
+- **quinn** – QUIC implementation
+- **rustls** – TLS for QUIC
+- **rcgen** – Certificate generation
+
+### Solana Ecosystem
+- **solana-sdk** – Types (Keypair, Pubkey, Transaction)
+- **solana-client** – RPC client
+- **yellowstone-grpc-proto** – Geyser protocol definitions
+
+### Utilities
+- **clap** – CLI parsing
+- **dashmap** – Lock-free concurrent HashMap
+- **anyhow/thiserror** – Error handling
+- **tonic** – gRPC client
+
+---
+
+## Performance Considerations
+
+1. **Connection reuse** – QUIC connections are expensive to establish; Slipstream caches and reuses them
+2. **Lock-free data structures** – Critical paths use atomics and DashMap to avoid mutex contention
+3. **Pre-warming** – Scout ensures connections are ready before they're needed
+4. **Stream multiplexing** – Machine gun mode amortizes connection overhead across many transactions
+5. **Geyser over RPC** – Push-based slot updates are faster than polling
+
+---
+
+## Security Notes
+
+- **Private keys** are loaded from disk and held in memory; ensure proper file permissions
+- **Self-signed certificates** are used for QUIC identity; this is expected by Solana validators
+- **No server verification** – Validators use ephemeral certificates, so client-side verification is disabled
+
+---
+
+## Updates
+
+### January 15, 2026 – QUIC Stream Optimization (Anza Feedback)
+
+**Implemented sequential stream handling and FIFO scheduling to eliminate UDP packet fragmentation.**
+
+#### Background
+
+Triton engineers identified that concurrent stream creation was causing QUIC packet fragmentation, forcing validators to work harder reassembling packets and leading to increased transaction drops. The root cause: multiple streams on the same connection were being sent in parallel, causing their UDP packets to interleave and fragment.
+
+#### Changes Made
+
+1. **Sequential Stream Sending** – Refactored `spam_transactions()` to use a sequential `for` loop instead of parallel `tokio::spawn`. Each transaction now completes as an atomic UDP packet before the next begins.
+
+2. **FIFO Stream Scheduling** – Added `transport_config.send_fairness(false)` to force first-in-first-out stream scheduling, eliminating QUIC's default round-robin fairness that was causing interleaving.
+
+3. **Dependency Upgrades** – Updated core networking stack:
+   - **quinn** 0.10 → 0.11 (adds `send_fairness()` API, `finish()` no longer async)
+   - **rustls** 0.21 → 0.23 (new builder patterns, `CryptoProvider` API)
+   - **rcgen** 0.11 → 0.13 (new `CertifiedKey` pattern)
+   - **solana-sdk** 1.18 → 2.1 (required for dependency compatibility)
+   - **yellowstone-grpc-proto** 1.4 → 10.1
+   - **tonic** 0.10 → 0.14
+
+#### Technical Details
+
+**Before (Parallel):**
+```rust
+for i in 0..count {
+    tokio::spawn(async move {
+        let mut stream = connection.open_uni().await?;
+        stream.write_all(&tx_bytes).await?;
+        stream.finish().await?;  // Multiple streams finishing concurrently
+    });
+}
+```
+
+**After (Sequential):**
+```rust
+for i in 0..count {
+    let mut stream = connection.open_uni().await?;
+    stream.write_all(&tx_bytes).await?;
+    stream.finish()?;  // Complete before next iteration
+}
+```
+
+**FIFO Scheduling** ([identity.rs](crates/slipstream-common/src/identity.rs)):
+```rust
+// CRITICAL: Disable fairness to force FIFO stream scheduling
+// This ensures each transaction completes as an atomic UDP packet before the next starts
+transport_config.send_fairness(false);
+```
+
+#### Impact
+
+- **Reduced Fragmentation** – Transactions arrive as complete, atomic UDP packets
+- **Higher Validator Acceptance** – Agave validators no longer need to reassemble fragmented packets
+- **Lower Latency** – FIFO scheduling removes pacing delays from fairness algorithms
+- **Optimization Focus Shift** – From "sending fast" (client metric) to "being processed fast" (validator metric)
+
+#### Files Modified
+
+- `Cargo.toml` – Updated all dependency versions
+- `crates/slipstream-common/src/identity.rs` – Added `send_fairness(false)`, updated API calls for rustls 0.23/rcgen 0.13
+- `crates/slipstream-common/src/error.rs` – Added `ClosedStreamError` variant
+- `crates/slipstream-net/src/engine.rs` – Removed `.await` from `finish()` calls, updated test helper for quinn 0.11
+- `crates/slipstream-net/src/geyser.rs` – Added new required fields for yellowstone-grpc-proto 10.1
+- `bin/slipstream-cli/src/main.rs` – Converted parallel to sequential sends in `spam_transactions()`
+
+---
+
+### January 13, 2026 – Slipstream Shield (Blocklist Protection)
+
+**Added validator blocklist filtering to protect against malicious validators.**
+
+#### What's New
+
+- **BlocklistManager** (`slipstream-net/src/blocklist.rs`) – Hot-swappable in-memory blocklist using `Arc<RwLock<HashSet<Pubkey>>>`
+- **Local-first design** – Maintains `blocklist.txt` file with periodic reloading (5-minute intervals)
+- **Optional remote sync** – Configure `SLIPSTREAM_BLOCKLIST_URL` for community-maintained blocklists
+- **Zero-latency filtering** – O(1) HashSet lookup with shared read locks (non-blocking for concurrent readers)
+- **Fail-safe updates** – Rejects empty remote responses to prevent accidental unblocking
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Cartographer (Leader Resolution)                   │
+│  ┌───────────────────────────────────────────────┐  │
+│  │ get_target(slot) → leader_pubkey              │  │
+│  │                                               │  │
+│  │ Shield Check:                                 │  │
+│  │   if blocklist.contains(leader_pubkey)        │  │
+│  │     return None  // Skip this validator       │  │
+│  │   else                                        │  │
+│  │     return leader_socket_address              │  │
+│  └───────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+```
+
+#### How It Works
+
+1. **Boot**: Shield loads `blocklist.txt` synchronously (fast startup with protection)
+2. **Filtering**: Cartographer checks blocklist before returning leader addresses
+   - `get_target(slot)` returns `None` if leader is blocked
+   - `get_upcoming_leaders()` filters blocked validators from Scout pre-warming
+3. **Hot-reload**: Background task reloads file every 5 minutes (or fetches from remote URL if configured)
+4. **Write lock**: Acquired only during updates (~once per 5 minutes), never blocks reads
+
+#### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SLIPSTREAM_BLOCKLIST_FILE` | `./blocklist.txt` | Local blocklist file path |
+| `SLIPSTREAM_BLOCKLIST_URL` | None (local-only) | Optional remote blocklist URL |
+| `SLIPSTREAM_BLOCKLIST_REFRESH_SECS` | `300` (5 min) | Reload interval |
+
+#### Usage
+
+**Add validators to blocklist:**
+```bash
+echo "MALICIOUS_VALIDATOR_PUBKEY" >> blocklist.txt
+```
+
+**Blocklist format** (`blocklist.txt`):
+```
+# Lines starting with # are comments
+# One base58 pubkey per line
+
+ABC123...xyz
+DEF456...uvw
+```
+
+**Enable remote sync** (optional):
+```bash
+export SLIPSTREAM_BLOCKLIST_URL="https://example.com/blocklist.txt"
+```
+
+#### Performance Impact
+
+- **Hot path (reads)**: ~40 nanoseconds (single HashSet lookup with shared RwLock)
+- **Cold path (updates)**: Brief write lock once per 5 minutes, no impact on transaction submission
+- **Scout optimization**: Blocked validators never consume pre-warming resources
+
+#### Implementation Files
+
+- `crates/slipstream-net/src/blocklist.rs` – BlocklistManager implementation
+- `crates/slipstream-net/src/cartographer.rs` – Shield filtering in get_target() and get_upcoming_leaders()
+- `bin/slipstream-cli/src/main.rs` – Shield initialization before Cartographer
+- `blocklist.txt` – Template blocklist file
