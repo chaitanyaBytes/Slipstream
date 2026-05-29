@@ -3975,6 +3975,7 @@ dependencies = [
  "slipstream-common",
  "slipstream-net",
  "solana-client",
+ "solana-rpc-client-api",
  "solana-sdk",
  "tokio",
  "tracing",

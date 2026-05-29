@@ -20,6 +20,7 @@ tracing-log = { workspace = true }
 # Solana Ecosystem
 solana-sdk = { workspace = true }
 solana-client = { workspace = true }
+solana-rpc-client-api = { workspace = true }
 anyhow = { workspace = true }
 
 # Utilities

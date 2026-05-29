@@ -7,6 +7,7 @@ use slipstream_net::{
     blocklist::BlocklistManager, cartographer::Cartographer, engine::QuicEngine,
     geyser::spawn_geyser_monitor,
 };
+use solana_rpc_client_api::config::RpcSendTransactionConfig;
 #[allow(deprecated)]
 use solana_sdk::{
     compute_budget::ComputeBudgetInstruction,
@@ -17,7 +18,7 @@ use solana_sdk::{
 };
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing_log::LogTracer;
 use tracing_subscriber::EnvFilter;
 
@@ -53,6 +54,16 @@ enum Commands {
         recipient: Option<String>,
         #[arg(long)]
         priority_fee: Option<u64>,
+    },
+    CompareLatency {
+        #[arg(short, long, default_value = "20")]
+        iterations: u64,
+        #[arg(short, long)]
+        recipient: Option<String>,
+        #[arg(long)]
+        priority_fee: Option<u64>,
+        #[arg(long, default_value_t = false)]
+        skip_rpc_preflight: bool,
     },
 }
 
@@ -223,6 +234,27 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             log_metrics("spam", &metrics);
+        }
+        Commands::CompareLatency {
+            iterations,
+            recipient,
+            priority_fee,
+            skip_rpc_preflight,
+        } => {
+            let to = parse_recipient(recipient, &identity)?;
+            let fee = priority_fee.unwrap_or(config.default_priority_fee);
+            compare_latency(
+                &cartographer,
+                &engine,
+                &identity,
+                to,
+                iterations,
+                fee,
+                &config,
+                &metrics,
+                skip_rpc_preflight,
+            )
+            .await?;
         }
     }
 
@@ -403,4 +435,178 @@ async fn spam_transactions(
         success_count, fail_count
     );
     Ok(())
+}
+
+async fn compare_latency(
+    cartographer: &Cartographer,
+    engine: &QuicEngine,
+    identity: &Keypair,
+    recipient: Pubkey,
+    iterations: u64,
+    priority_fee: u64,
+    config: &Config,
+    metrics: &Metrics,
+    skip_rpc_preflight: bool,
+) -> anyhow::Result<()> {
+    let rpc = cartographer.rpc_client();
+    let sender = identity.pubkey();
+    let sender_balance = rpc.get_balance(&sender).await?;
+    if sender_balance == 0 {
+        return Err(anyhow::anyhow!(
+            "Sender wallet {} has 0 lamports on current cluster. Fund it first (e.g. devnet airdrop).",
+            sender
+        ));
+    }
+
+    let recipient_effective = match rpc.get_account(&recipient).await {
+        Ok(_) => recipient,
+        Err(_) => {
+            warn!(
+                "Recipient {} has no account on current cluster. Falling back to self-transfer for benchmark.",
+                recipient
+            );
+            sender
+        }
+    };
+
+    let mut direct_ms = Vec::new();
+    let mut rpc_ms = Vec::new();
+
+    println!(
+        "Running latency comparison for {} iterations...",
+        iterations
+    );
+    println!("Note: this sends real transactions on the configured cluster.");
+
+    for i in 0..iterations {
+        // Direct path
+        let slot = cartographer.get_known_slot();
+        let target = match cartographer.get_target(slot).await {
+            Some(t) => t,
+            None => {
+                metrics.inc_leader_lookup_failed();
+                warn!(
+                    "[{}] direct path skipped: no leader for slot {}",
+                    i + 1,
+                    slot
+                );
+                continue;
+            }
+        };
+
+        let blockhash_direct = rpc.get_latest_blockhash().await?;
+        let tx_direct = build_signed_transfer_tx(
+            identity,
+            recipient_effective,
+            priority_fee,
+            config.default_compute_unit_limit,
+            blockhash_direct,
+        );
+        let tx_direct_bytes = bincode::serialize(&tx_direct)?;
+
+        metrics.inc_tx_attempted();
+        let start_direct = Instant::now();
+        match engine.send_transaction(target, tx_direct_bytes).await {
+            Ok(()) => {
+                metrics.inc_tx_sent();
+                direct_ms.push(start_direct.elapsed().as_secs_f64() * 1000.0);
+            }
+            Err(e) => {
+                metrics.inc_tx_failed();
+                warn!("[{}] direct send failed: {}", i + 1, e);
+            }
+        }
+
+        // RPC path
+        let blockhash_rpc = rpc.get_latest_blockhash().await?;
+        let tx_rpc = build_signed_transfer_tx(
+            identity,
+            recipient_effective,
+            priority_fee,
+            config.default_compute_unit_limit,
+            blockhash_rpc,
+        );
+
+        metrics.inc_tx_attempted();
+        let start_rpc = Instant::now();
+        match rpc
+            .send_transaction_with_config(
+                &tx_rpc,
+                RpcSendTransactionConfig {
+                    skip_preflight: skip_rpc_preflight,
+                    ..RpcSendTransactionConfig::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {
+                metrics.inc_tx_sent();
+                rpc_ms.push(start_rpc.elapsed().as_secs_f64() * 1000.0);
+            }
+            Err(e) => {
+                metrics.inc_tx_failed();
+                warn!("[{}] rpc send failed: {}", i + 1, e);
+            }
+        }
+    }
+
+    print_latency_summary("Direct QUIC", &direct_ms);
+    print_latency_summary("RPC Submit", &rpc_ms);
+    log_metrics("compare-latency", metrics);
+
+    Ok(())
+}
+
+fn build_signed_transfer_tx(
+    identity: &Keypair,
+    recipient: Pubkey,
+    priority_fee: u64,
+    compute_limit: u32,
+    blockhash: solana_sdk::hash::Hash,
+) -> Transaction {
+    let instructions = vec![
+        ComputeBudgetInstruction::set_compute_unit_limit(compute_limit),
+        ComputeBudgetInstruction::set_compute_unit_price(priority_fee),
+        system_instruction::transfer(&identity.pubkey(), &recipient, 1),
+    ];
+
+    Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&identity.pubkey()),
+        &[identity],
+        blockhash,
+    )
+}
+
+fn print_latency_summary(label: &str, samples_ms: &[f64]) {
+    if samples_ms.is_empty() {
+        println!("{}: no successful samples", label);
+        return;
+    }
+
+    let mut sorted = samples_ms.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let p50 = percentile(&sorted, 0.50);
+    let p95 = percentile(&sorted, 0.95);
+    let p99 = percentile(&sorted, 0.99);
+    let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+
+    println!(
+        "{} -> n={} avg={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms",
+        label,
+        sorted.len(),
+        avg,
+        p50,
+        p95,
+        p99
+    );
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted[rank]
 }
