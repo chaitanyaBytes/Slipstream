@@ -6,6 +6,16 @@ Slipstream is a high-performance Solana transaction client that bypasses traditi
 
 Built for MEV searchers, traders, and anyone needing the absolute lowest latency for Solana transaction submission.
 
+## Latest Benchmark Snapshot (Devnet)
+
+| Path | Samples | Avg (ms) | p50 (ms) | p95 (ms) | p99 (ms) |
+|---|---:|---:|---:|---:|---:|
+| Direct QUIC | 20 | 0.02 | 0.02 | 0.03 | 0.03 |
+| RPC Submit | 20 | 130.05 | 103.80 | 203.26 | 313.29 |
+
+Direct QUIC shows much lower client-side submission overhead than RPC round-trip submission in this run.
+
+
 ## Performance
 
 | Optimization | Description |
@@ -180,3 +190,35 @@ See [explanation.md#updates](explanation.md#updates) for detailed architecture a
 ## Contributing
 
 Open an issue or submit a pull request.
+
+## Latency Results Interpretation
+
+When you run `compare-latency`, the two paths measure different scopes:
+
+- `Direct QUIC` measures **client-side submit overhead** (writing tx bytes to a QUIC stream).
+- `RPC Submit` measures **RPC request/response round-trip latency** (network + RPC server processing).
+
+So it is expected that `Direct QUIC` appears much smaller than `RPC Submit`.
+
+Important:
+- These numbers are **not confirmation/finality latency**.
+- They are submission-path latency measurements.
+
+Recommended benchmark practice:
+
+1. Run on devnet with a funded wallet.
+2. Use self-transfer recipient first.
+3. Use low priority fee for cleaner comparisons.
+4. Report success rate with latency percentiles (`p50/p95/p99`).
+
+Example:
+
+```bash
+SOLANA_RPC_URL="https://api.devnet.solana.com" \
+RUST_LOG=info \
+cargo run --release -- compare-latency \
+  --iterations 20 \
+  --recipient <YOUR_PUBKEY> \
+  --priority-fee 1 \
+  --skip-rpc-preflight
+```
