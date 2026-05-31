@@ -8,23 +8,26 @@ Built for MEV searchers, traders, and anyone needing the absolute lowest latency
 
 ## Latest Benchmark Snapshot (Devnet)
 
-| Path | Samples | Avg (ms) | p50 (ms) | p95 (ms) | p99 (ms) |
-|---|---:|---:|---:|---:|---:|
-| Direct QUIC | 20 | 0.02 | 0.02 | 0.03 | 0.03 |
-| RPC Submit | 20 | 130.05 | 103.80 | 203.26 | 313.29 |
+
+| Path        | Samples | Avg (ms) | p50 (ms) | p95 (ms) | p99 (ms) |
+| ----------- | ------- | -------- | -------- | -------- | -------- |
+| Direct QUIC | 20      | 0.02     | 0.02     | 0.03     | 0.03     |
+| RPC Submit  | 20      | 130.05   | 103.80   | 203.26   | 313.29   |
+
 
 Direct QUIC shows much lower client-side submission overhead than RPC round-trip submission in this run.
 
-
 ## Performance
 
-| Optimization | Description |
-|--------------|-------------|
-| **Lock-free Connection Cache** | Uses `dashmap` for concurrent access without mutex contention |
-| **QUIC Stream Multiplexing** | Reuses single connection with parallel unidirectional streams, avoiding per-transaction handshake overhead |
-| **Connection Pre-warming** | Scout task maintains hot connections to upcoming leaders, eliminating QUIC handshake latency |
-| **Atomic Slot Tracking** | `AtomicU64` for slot updates with no locks on reads |
-| **Exponential Backoff** | Graceful Geyser reconnection with capped exponential backoff |
+
+| Optimization                   | Description                                                                                                |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| **Lock-free Connection Cache** | Uses `dashmap` for concurrent access without mutex contention                                              |
+| **QUIC Stream Multiplexing**   | Reuses single connection with parallel unidirectional streams, avoiding per-transaction handshake overhead |
+| **Connection Pre-warming**     | Scout task maintains hot connections to upcoming leaders, eliminating QUIC handshake latency               |
+| **Atomic Slot Tracking**       | `AtomicU64` for slot updates with no locks on reads                                                        |
+| **Exponential Backoff**        | Graceful Geyser reconnection with capped exponential backoff                                               |
+
 
 ## Features
 
@@ -112,27 +115,29 @@ slipstream/
 
 ## Configuration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` | RPC endpoint |
-| `GEYSER_URL` | — | Yellowstone Geyser gRPC endpoint (enables hybrid mode) |
-| `RPC_POLL_INTERVAL_MS` | `400` | Slot polling interval (legacy mode) |
-| `SCOUT_INTERVAL_MS` | `1000` | Connection pre-warming interval |
-| `SCOUT_LOOKAHEAD_SLOTS` | `10` | Slots ahead to pre-warm connections |
-| `MONITOR_INTERVAL_MS` | `400` | Monitor display refresh rate |
-| `QUIC_KEEP_ALIVE_SECS` | `5` | QUIC keep-alive interval |
-| `QUIC_IDLE_TIMEOUT_SECS` | `10` | QUIC connection idle timeout |
-| `DEFAULT_COMPUTE_UNIT_LIMIT` | `200000` | Compute budget per transaction |
-| `DEFAULT_PRIORITY_FEE` | `100000` | Priority fee in microlamports |
-| `SLIPSTREAM_BLOCKLIST_FILE` | `./blocklist.txt` | Local blocklist file path |
-| `SLIPSTREAM_BLOCKLIST_URL` | — | Optional remote blocklist URL |
-| `SLIPSTREAM_BLOCKLIST_REFRESH_SECS` | `300` | Blocklist reload interval (seconds) |
+
+| Variable                            | Default                               | Description                                            |
+| ----------------------------------- | ------------------------------------- | ------------------------------------------------------ |
+| `SOLANA_RPC_URL`                    | `https://api.mainnet-beta.solana.com` | RPC endpoint                                           |
+| `GEYSER_URL`                        | —                                     | Yellowstone Geyser gRPC endpoint (enables hybrid mode) |
+| `RPC_POLL_INTERVAL_MS`              | `400`                                 | Slot polling interval (legacy mode)                    |
+| `SCOUT_INTERVAL_MS`                 | `1000`                                | Connection pre-warming interval                        |
+| `SCOUT_LOOKAHEAD_SLOTS`             | `10`                                  | Slots ahead to pre-warm connections                    |
+| `MONITOR_INTERVAL_MS`               | `400`                                 | Monitor display refresh rate                           |
+| `QUIC_KEEP_ALIVE_SECS`              | `5`                                   | QUIC keep-alive interval                               |
+| `QUIC_IDLE_TIMEOUT_SECS`            | `10`                                  | QUIC connection idle timeout                           |
+| `DEFAULT_COMPUTE_UNIT_LIMIT`        | `200000`                              | Compute budget per transaction                         |
+| `DEFAULT_PRIORITY_FEE`              | `100000`                              | Priority fee in microlamports                          |
+| `SLIPSTREAM_BLOCKLIST_FILE`         | `./blocklist.txt`                     | Local blocklist file path                              |
+| `SLIPSTREAM_BLOCKLIST_URL`          | —                                     | Optional remote blocklist URL                          |
+| `SLIPSTREAM_BLOCKLIST_REFRESH_SECS` | `300`                                 | Blocklist reload interval (seconds)                    |
+
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                       slipstream-cli                          │
+│                       slipstream-cli                        │
 │  (CLI parsing, command dispatch, async runtime)             │
 └─────────────────────────────────────────────────────────────┘
                             │
@@ -146,13 +151,13 @@ slipstream/
             └───────────────┼───────────────┘
                             ▼
                 ┌───────────────────────┐
-                │    slipstream-common    │
+                │    slipstream-common  │
                 │ (Config, Identity,    │
                 │  Error Types)         │
                 └───────────────────────┘
 ```
 
-<img width="1672" height="941" alt="Image" src="https://github.com/user-attachments/assets/e7d7c4cc-d808-481e-bc9b-48921c2e7d9a" />
+
 
 ## Validator Blocklist (Shield)
 
@@ -161,12 +166,10 @@ Slipstream Shield protects against malicious validators by filtering them from l
 ### Quick Setup
 
 1. Create `blocklist.txt` in the project root:
-
-   ```bash
+  ```bash
    # Add one validator pubkey per line
    echo "MALICIOUS_VALIDATOR_PUBKEY_HERE" >> blocklist.txt
-   ```
-
+  ```
 2. Slipstream automatically loads and hot-reloads the file every 5 minutes
 
 ### Features
@@ -201,6 +204,7 @@ When you run `compare-latency`, the two paths measure different scopes:
 So it is expected that `Direct QUIC` appears much smaller than `RPC Submit`.
 
 Important:
+
 - These numbers are **not confirmation/finality latency**.
 - They are submission-path latency measurements.
 
@@ -222,3 +226,4 @@ cargo run --release -- compare-latency \
   --priority-fee 1 \
   --skip-rpc-preflight
 ```
+
