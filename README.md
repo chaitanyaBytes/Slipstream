@@ -157,6 +157,7 @@ slipstream/
                 └───────────────────────┘
 ```
 
+<img width="1672" height="941" alt="Image" src="https://github.com/user-attachments/assets/e7d7c4cc-d808-481e-bc9b-48921c2e7d9a" />
 
 
 ## Validator Blocklist (Shield)
